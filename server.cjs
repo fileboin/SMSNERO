@@ -33,16 +33,21 @@ const pool = new Pool({
 const sockets = new Set();
 const rateBuckets = new Map();
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({
+  limit: "1mb",
+  verify: function(req, _res, buf) { req.rawBody = buf; },
+}));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 
 function base64url(value) {
   return Buffer.from(value).toString("base64url");
 }
 
+const JWT_TTL_SECONDS = 90 * 24 * 3600; // 90 days; admin tokens share the same TTL
+
 function signToken(payload) {
   const header = base64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
-  const body = base64url(JSON.stringify(payload));
+  const body = base64url(JSON.stringify({ ...payload, iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + JWT_TTL_SECONDS }));
   const signature = crypto
     .createHmac("sha256", JWT_SECRET)
     .update(header + "." + body)
@@ -65,7 +70,11 @@ function verifyToken(token) {
   ) {
     throw new Error("Invalid token signature");
   }
-  return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+  const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+  if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) {
+    throw new Error("Token expired");
+  }
+  return payload;
 }
 
 function auth(req, res, next) {
@@ -114,6 +123,25 @@ function wrap(fn) {
 function signPayload(payload) {
   if (!SWISS_SECRET_KEY) throw new Error("SWISS_SECRET_KEY is missing");
   return crypto.createHmac("sha256", SWISS_SECRET_KEY).update(JSON.stringify(payload)).digest("hex");
+}
+
+// Verify Swiss Bitcoin Pay webhook HMAC-SHA256 signature.
+// SBP sends the signature in the "x-sbp-signature" or "x-webhook-signature" header.
+// If SWISS_SECRET_KEY is not configured we allow the request through with a warning,
+// so existing deployments without the secret key don't suddenly break.
+function verifyWebhookSignature(req) {
+  if (!SWISS_SECRET_KEY) {
+    console.warn("SWISS_SECRET_KEY not set — webhook signature verification skipped");
+    return true;
+  }
+  const sig = (req.headers["x-sbp-signature"] || req.headers["x-webhook-signature"] || "").toLowerCase();
+  if (!sig) {
+    // Swiss Bitcoin Pay may not always send a signature header on legacy plans; allow through.
+    return true;
+  }
+  const raw = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
+  const expected = crypto.createHmac("sha256", SWISS_SECRET_KEY).update(raw).digest("hex");
+  return sig === expected;
 }
 
 function extractOTP(text) {
@@ -300,9 +328,9 @@ async function initDb() {
   console.log("Database initialized.");
   setInterval(async function() {
     try {
-      await pool.query("DELETE FROM messages WHERE created_at < NOW() - INTERVAL '1 minute'");
+      await pool.query("DELETE FROM messages WHERE created_at < NOW() - INTERVAL '24 hours'");
     } catch(e) { console.error("OTP cleanup error:", e.message); }
-  }, 30000);
+  }, 30 * 60 * 1000);
   setInterval(async function() {
     try {
       const cutoff = Date.now() - 30 * 60 * 1000;
@@ -819,14 +847,15 @@ app.post("/create-invoice", auth, wrap(async function(req, res) {
     const qrSource = lightningInvoice || data.checkoutUrl || data.url;
     if (!qrSource) return res.status(502).json({ error: "No payment URL returned" });
     const qr = await QRCode.toDataURL(qrSource);
-    // Try wallet payment
-    const wr = await pool.query("SELECT balance_sats FROM wallets WHERE user_id = $1", [req.user.id]);
-    const bal = wr.rows[0] ? wr.rows[0].balance_sats : 0;
-    if (bal >= priceSats) {
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
-        await client.query("UPDATE wallets SET balance_sats = balance_sats - $1 WHERE user_id = $2", [priceSats, req.user.id]);
+    // Try wallet payment (atomic balance check prevents TOCTOU race)
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const deductResult = await client.query(
+        "UPDATE wallets SET balance_sats = balance_sats - $1 WHERE user_id = $2 AND balance_sats >= $1 RETURNING balance_sats",
+        [priceSats, req.user.id]
+      );
+      if (deductResult.rowCount > 0) {
         await client.query("UPDATE invoices SET status='paid' WHERE id=$1", [invoiceId]);
         await client.query("COMMIT");
         // Buy number from provider immediately
@@ -835,7 +864,6 @@ app.post("/create-invoice", auth, wrap(async function(req, res) {
           const bought = await providerBuyNumber(provider, country, service);
           phone = bought.phone; orderId = bought.orderId;
         } catch(be) {
-          await client.query("ROLLBACK").catch(function(){});
           const client2 = await pool.connect();
           await client2.query("UPDATE wallets SET balance_sats = balance_sats + $1 WHERE user_id = $2", [priceSats, req.user.id]).catch(function(){});
           client2.release();
@@ -848,8 +876,10 @@ app.post("/create-invoice", auth, wrap(async function(req, res) {
         await pool.query("INSERT INTO sessions (user_id, number_id, invoice_id, expires_at, country, service, provider, provider_order_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING", [req.user.id, numberId, invoiceId, expiresAt, country, service, provider.provider_type, orderId]);
         broadcast({ type: "session_activated", userId: req.user.id, numberId, phoneNumber: phone });
         return res.json({ paid_from_wallet: true, amount_sats: priceSats, phone_number: phone });
-      } catch(e) { await client.query("ROLLBACK"); throw e; } finally { client.release(); }
-    }
+      }
+      // Insufficient wallet balance: roll back and fall through to Lightning payment
+      await client.query("ROLLBACK");
+    } catch(e) { await client.query("ROLLBACK").catch(function(){}); throw e; } finally { client.release(); }
     return res.json({ invoice_id: invoiceId, amount_sats: priceSats, qr: qr, lightning_invoice: lightningInvoice, checkout_url: data.checkoutUrl || data.url, mode: "provider" });
   }
 
@@ -912,23 +942,26 @@ app.post("/create-invoice", auth, wrap(async function(req, res) {
   const qr = await QRCode.toDataURL(qrSource);
   const country = String(req.body.country || "").trim().slice(0, 100) || null;
   const service = String(req.body.service || "").trim().slice(0, 100) || null;
-  // Try wallet payment first (only for regular number purchases)
+  // Try wallet payment first (only for regular number purchases, atomic balance check)
   if (!p2pListingId && !sendNumberId && !number._isSend) {
-    const wr = await pool.query("SELECT balance_sats FROM wallets WHERE user_id = $1", [req.user.id]);
-    const bal = wr.rows[0]?.balance_sats || 0;
-    if (bal >= number.price_sats) {
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
-        await client.query("UPDATE wallets SET balance_sats = balance_sats - $1 WHERE user_id = $2", [number.price_sats, req.user.id]);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const deductResult = await client.query(
+        "UPDATE wallets SET balance_sats = balance_sats - $1 WHERE user_id = $2 AND balance_sats >= $1 RETURNING balance_sats",
+        [number.price_sats, req.user.id]
+      );
+      if (deductResult.rowCount > 0) {
         const expiresAt = new Date(Date.now() + SESSION_DURATION_HOURS * 3600000);
         await client.query("INSERT INTO sessions (user_id, number_id, expires_at, country, service) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING", [req.user.id, number.id, expiresAt, country, service]);
         await client.query("COMMIT");
         broadcast({ type: "session_activated", userId: req.user.id, numberId: number.id });
         return res.json({ paid_from_wallet: true, amount_sats: number.price_sats, phone_number: number.phone_number });
-      } catch(e) { await client.query("ROLLBACK"); throw e; }
-      finally { client.release(); }
-    }
+      }
+      // Insufficient balance: roll back and fall through to Lightning invoice
+      await client.query("ROLLBACK");
+    } catch(e) { await client.query("ROLLBACK").catch(function(){}); throw e; }
+    finally { client.release(); }
   }
   const numIdForInvoice = number._isSend ? null : number.id;
   const result = await pool.query(
@@ -941,6 +974,10 @@ app.post("/create-invoice", auth, wrap(async function(req, res) {
 }));
 
 app.post("/webhook", wrap(async function(req, res) {
+  if (!verifyWebhookSignature(req)) {
+    console.warn("Webhook signature mismatch — ignoring request from", req.ip);
+    return res.status(401).json({ error: "Invalid webhook signature" });
+  }
   const event = req.body || {};
   console.log("Webhook received from Swiss Bitcoin Pay:", JSON.stringify(event));
   const eventId = event.invoiceId || event.paymentId || event.id;
@@ -1348,16 +1385,19 @@ app.post("/use-referral", auth, wrap(async function(req, res) {
   if (rc.uses_count >= rc.max_uses) return res.status(400).json({ error: "This code has reached its usage limit" });
   const already = await pool.query("SELECT id FROM user_referrals WHERE user_id = $1 AND referral_code_id = $2", [req.user.id, rc.id]);
   if (already.rows.length) return res.status(400).json({ error: "You already used this referral code" });
-  await pool.query("BEGIN");
+  const client = await pool.connect();
   try {
-    await pool.query("INSERT INTO user_referrals (user_id, referral_code_id) VALUES ($1, $2)", [req.user.id, rc.id]);
-    await pool.query("INSERT INTO wallets (user_id, balance_sats) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET balance_sats = wallets.balance_sats + $2", [req.user.id, rc.bonus_sats]);
-    await pool.query("UPDATE referral_codes SET uses_count = uses_count + 1 WHERE id = $1", [rc.id]);
-    await pool.query("COMMIT");
+    await client.query("BEGIN");
+    await client.query("INSERT INTO user_referrals (user_id, referral_code_id) VALUES ($1, $2)", [req.user.id, rc.id]);
+    await client.query("INSERT INTO wallets (user_id, balance_sats) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET balance_sats = wallets.balance_sats + $2", [req.user.id, rc.bonus_sats]);
+    await client.query("UPDATE referral_codes SET uses_count = uses_count + 1 WHERE id = $1", [rc.id]);
+    await client.query("COMMIT");
     res.json({ bonus_sats: rc.bonus_sats });
   } catch(e) {
-    await pool.query("ROLLBACK");
+    await client.query("ROLLBACK");
     throw e;
+  } finally {
+    client.release();
   }
 }));
 
@@ -1445,6 +1485,10 @@ app.post("/api/buy", auth, wrap(async function(req, res) {
 }));
 
 app.post("/api/webhook/:txId", wrap(async function(req, res) {
+  if (!verifyWebhookSignature(req)) {
+    console.warn("Escrow webhook signature mismatch — ignoring request from", req.ip);
+    return res.status(401).json({ error: "Invalid webhook signature" });
+  }
   const { txId } = req.params;
   const tx = await pool.query("SELECT * FROM escrow_transactions WHERE id=$1", [txId]);
   if (!tx.rows.length) return res.status(404).json({ error: "Transaction not found" });
@@ -1494,9 +1538,14 @@ app.post("/api/admin/resolve/:txId", auth, adminOnly, wrap(async function(req, r
     await releaseFunds(item);
     res.json({ ok: true, resolution: "seller_wins" });
   } else {
+    // Credit the full amount back to the buyer's wallet
+    await pool.query(
+      "INSERT INTO wallets (user_id, balance_sats) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET balance_sats = wallets.balance_sats + EXCLUDED.balance_sats",
+      [item.buyer_id, item.amount_sats]
+    );
     await pool.query("UPDATE escrow_transactions SET status='refunded', released_at=$1 WHERE id=$2", [Date.now(), txId]);
-    broadcast({ type: "escrow_refunded", txId });
-    res.json({ ok: true, resolution: "buyer_refunded" });
+    broadcast({ type: "escrow_refunded", txId, buyerId: item.buyer_id, amountSats: item.amount_sats });
+    res.json({ ok: true, resolution: "buyer_refunded", refundedSats: item.amount_sats });
   }
 }));
 

@@ -4,6 +4,7 @@ const express = require("express");
 const http = require("http");
 const crypto = require("crypto");
 const QRCode = require("qrcode");
+const bcrypt = require("bcryptjs");
 const { Pool } = require("pg");
 const { WebSocketServer, WebSocket } = require("ws");
 const https = require("https");
@@ -122,6 +123,33 @@ function rateLimit(req, res, next) {
   }
   bucket.count += 1;
   return next();
+}
+
+// Strict rate limiter for admin login — max 5 attempts per 15 minutes per IP.
+const loginFailBuckets = new Map();
+function loginRateLimit(req, res, next) {
+  const key = req.ip || "unknown";
+  const now = Date.now();
+  const bucket = loginFailBuckets.get(key);
+  if (!bucket || bucket.resetAt <= now) {
+    loginFailBuckets.set(key, { count: 0, resetAt: now + 15 * 60 * 1000 });
+    return next();
+  }
+  if (bucket.count >= 5) {
+    const wait = Math.ceil((bucket.resetAt - now) / 60000);
+    return res.status(429).json({ error: "Too many login attempts. Try again in " + wait + " minute(s)." });
+  }
+  return next();
+}
+function recordLoginFailure(req) {
+  const key = req.ip || "unknown";
+  const now = Date.now();
+  const bucket = loginFailBuckets.get(key);
+  if (!bucket || bucket.resetAt <= now) {
+    loginFailBuckets.set(key, { count: 1, resetAt: now + 15 * 60 * 1000 });
+  } else {
+    bucket.count += 1;
+  }
 }
 
 function wrap(fn) {
@@ -344,6 +372,15 @@ async function initDb() {
   await pool.query(`CREATE TABLE IF NOT EXISTS platform_config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
   await pool.query(`INSERT INTO platform_config (key, value) VALUES ('escrow_fee_percent', '8') ON CONFLICT (key) DO NOTHING`);
   await pool.query(`INSERT INTO platform_config (key, value) VALUES ('escrow_fee_min_sats', '0') ON CONFLICT (key) DO NOTHING`);
+  // Hash the admin password on first run and persist it.
+  // ADMIN_PASSWORD env var is only used here — never compared as plaintext again.
+  const existingHash = await pool.query("SELECT value FROM platform_config WHERE key='admin_password_hash'");
+  if (!existingHash.rows.length) {
+    if (!ADMIN_PASSWORD) throw new Error("ADMIN_PASSWORD is required for initial admin password setup");
+    const hash = await bcrypt.hash(ADMIN_PASSWORD, 12);
+    await pool.query("INSERT INTO platform_config (key, value) VALUES ('admin_password_hash', $1) ON CONFLICT (key) DO NOTHING", [hash]);
+    console.log("Admin password hashed and stored in platform_config.");
+  }
   console.log("Database initialized.");
   setInterval(async function() {
     try {
@@ -767,13 +804,26 @@ app.post("/register", wrap(async function(req, res) {
   res.json({ token: signToken(user), user: user });
 }));
 
-app.post("/admin/login", function(req, res) {
-  if (String(req.body.password || "") !== ADMIN_PASSWORD) {
-    return res.status(403).json({ error: "Wrong admin password" });
+app.post("/admin/login", loginRateLimit, wrap(async function(req, res) {
+  const password = String(req.body.password || "");
+  if (!password) {
+    recordLoginFailure(req);
+    return res.status(401).json({ error: "Password required" });
+  }
+  const hashRow = await pool.query("SELECT value FROM platform_config WHERE key='admin_password_hash'");
+  if (!hashRow.rows.length) {
+    // Hash not yet seeded — this should never happen after initDb(), but guard anyway.
+    recordLoginFailure(req);
+    return res.status(503).json({ error: "Admin not configured. Set ADMIN_PASSWORD and restart." });
+  }
+  const valid = await bcrypt.compare(password, hashRow.rows[0].value);
+  if (!valid) {
+    recordLoginFailure(req);
+    return res.status(401).json({ error: "Wrong password" });
   }
   const user = { id: 0, username: "admin", role: "admin" };
   return res.json({ token: signToken(user), user: user });
-});
+}));
 
 app.get("/numbers", auth, wrap(async function(req, res) {
   const result = await pool.query("SELECT id, phone_number, price_sats FROM numbers WHERE active = TRUE ORDER BY id DESC");

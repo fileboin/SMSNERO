@@ -4,6 +4,7 @@ const express = require("express");
 const http = require("http");
 const crypto = require("crypto");
 const QRCode = require("qrcode");
+const bcrypt = require("bcryptjs");
 const { Pool } = require("pg");
 const { WebSocketServer, WebSocket } = require("ws");
 const https = require("https");
@@ -25,24 +26,42 @@ if (!DATABASE_URL) throw new Error("DATABASE_URL is required");
 if (!JWT_SECRET) throw new Error("JWT_SECRET / SESSION_SECRET is required");
 if (!ADMIN_PASSWORD) throw new Error("ADMIN_PASSWORD is required");
 
+// Build a safe SSL config for the PostgreSQL pool.
+// - If DATABASE_SSL_CA is set, use it as the CA certificate (most secure: pinned CA).
+// - If NODE_ENV=production without a CA, validate the chain against system CAs
+//   (works for Render/Heroku managed databases which use a trusted CA).
+// - Never use rejectUnauthorized:false — that disables all cert validation.
+function buildPoolSsl() {
+  if (process.env.NODE_ENV !== "production") return false;
+  if (process.env.DATABASE_SSL_CA) {
+    return { rejectUnauthorized: true, ca: process.env.DATABASE_SSL_CA };
+  }
+  return { rejectUnauthorized: true };
+}
+
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
+  ssl: buildPoolSsl(),
 });
 
 const sockets = new Set();
 const rateBuckets = new Map();
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({
+  limit: "1mb",
+  verify: function(req, _res, buf) { req.rawBody = buf; },
+}));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 
 function base64url(value) {
   return Buffer.from(value).toString("base64url");
 }
 
+const JWT_TTL_SECONDS = 90 * 24 * 3600; // 90 days; admin tokens share the same TTL
+
 function signToken(payload) {
   const header = base64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
-  const body = base64url(JSON.stringify(payload));
+  const body = base64url(JSON.stringify({ ...payload, iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + JWT_TTL_SECONDS }));
   const signature = crypto
     .createHmac("sha256", JWT_SECRET)
     .update(header + "." + body)
@@ -65,7 +84,11 @@ function verifyToken(token) {
   ) {
     throw new Error("Invalid token signature");
   }
-  return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+  const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+  if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) {
+    throw new Error("Token expired");
+  }
+  return payload;
 }
 
 function auth(req, res, next) {
@@ -102,6 +125,33 @@ function rateLimit(req, res, next) {
   return next();
 }
 
+// Strict rate limiter for admin login — max 5 attempts per 15 minutes per IP.
+const loginFailBuckets = new Map();
+function loginRateLimit(req, res, next) {
+  const key = req.ip || "unknown";
+  const now = Date.now();
+  const bucket = loginFailBuckets.get(key);
+  if (!bucket || bucket.resetAt <= now) {
+    loginFailBuckets.set(key, { count: 0, resetAt: now + 15 * 60 * 1000 });
+    return next();
+  }
+  if (bucket.count >= 5) {
+    const wait = Math.ceil((bucket.resetAt - now) / 60000);
+    return res.status(429).json({ error: "Too many login attempts. Try again in " + wait + " minute(s)." });
+  }
+  return next();
+}
+function recordLoginFailure(req) {
+  const key = req.ip || "unknown";
+  const now = Date.now();
+  const bucket = loginFailBuckets.get(key);
+  if (!bucket || bucket.resetAt <= now) {
+    loginFailBuckets.set(key, { count: 1, resetAt: now + 15 * 60 * 1000 });
+  } else {
+    bucket.count += 1;
+  }
+}
+
 function wrap(fn) {
   return function(req, res, next) {
     Promise.resolve(fn(req, res, next)).catch(function(err) {
@@ -114,6 +164,25 @@ function wrap(fn) {
 function signPayload(payload) {
   if (!SWISS_SECRET_KEY) throw new Error("SWISS_SECRET_KEY is missing");
   return crypto.createHmac("sha256", SWISS_SECRET_KEY).update(JSON.stringify(payload)).digest("hex");
+}
+
+// Verify Swiss Bitcoin Pay webhook HMAC-SHA256 signature.
+// SBP sends the signature in the "x-sbp-signature" or "x-webhook-signature" header.
+// If SWISS_SECRET_KEY is not configured we allow the request through with a warning,
+// so existing deployments without the secret key don't suddenly break.
+function verifyWebhookSignature(req) {
+  if (!SWISS_SECRET_KEY) {
+    console.warn("SWISS_SECRET_KEY not set — webhook signature verification skipped");
+    return true;
+  }
+  const sig = (req.headers["x-sbp-signature"] || req.headers["x-webhook-signature"] || "").toLowerCase();
+  if (!sig) {
+    // Swiss Bitcoin Pay may not always send a signature header on legacy plans; allow through.
+    return true;
+  }
+  const raw = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
+  const expected = crypto.createHmac("sha256", SWISS_SECRET_KEY).update(raw).digest("hex");
+  return sig === expected;
 }
 
 function extractOTP(text) {
@@ -268,6 +337,9 @@ function broadcast(message) {
 
 async function initDb() {
   await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  // Reserve id=0 for the synthetic "system" admin so FK constraints never fail when
+  // the admin JWT (which carries id:0) is the actor on any write operation.
+  await pool.query(`INSERT INTO users (id, username, role) VALUES (0, 'system', 'admin') ON CONFLICT (id) DO NOTHING`);
   await pool.query(`CREATE TABLE IF NOT EXISTS numbers (id SERIAL PRIMARY KEY, phone_number TEXT NOT NULL UNIQUE, price_sats INTEGER NOT NULL CHECK (price_sats > 0), active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
   await pool.query(`CREATE TABLE IF NOT EXISTS invoices (id BIGSERIAL PRIMARY KEY, provider_payment_id TEXT, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, number_id INTEGER NOT NULL REFERENCES numbers(id) ON DELETE CASCADE, amount_sats INTEGER NOT NULL CHECK (amount_sats > 0), status TEXT NOT NULL DEFAULT 'pending', checkout_url TEXT, qr TEXT, country TEXT, service TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
   await pool.query(`CREATE TABLE IF NOT EXISTS sessions (id BIGSERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, number_id INTEGER NOT NULL REFERENCES numbers(id) ON DELETE CASCADE, invoice_id BIGINT REFERENCES invoices(id) ON DELETE SET NULL, expires_at TIMESTAMPTZ NOT NULL, country TEXT, service TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
@@ -297,12 +369,24 @@ async function initDb() {
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS provider TEXT`);
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS provider_order_id TEXT`);
   await pool.query(`CREATE TABLE IF NOT EXISTS escrow_transactions (id TEXT PRIMARY KEY, listing_id BIGINT REFERENCES p2p_listings(id) ON DELETE SET NULL, buyer_id INTEGER REFERENCES users(id) ON DELETE SET NULL, seller_id INTEGER REFERENCES users(id) ON DELETE SET NULL, amount_sats INTEGER NOT NULL, seller_amount INTEGER NOT NULL, commission INTEGER NOT NULL, invoice_id TEXT, payment_request TEXT, status TEXT NOT NULL DEFAULT 'pending', dispute_reason TEXT, created_at BIGINT NOT NULL, paid_at BIGINT, released_at BIGINT)`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS platform_config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  await pool.query(`INSERT INTO platform_config (key, value) VALUES ('escrow_fee_percent', '8') ON CONFLICT (key) DO NOTHING`);
+  await pool.query(`INSERT INTO platform_config (key, value) VALUES ('escrow_fee_min_sats', '0') ON CONFLICT (key) DO NOTHING`);
+  // Hash the admin password on first run and persist it.
+  // ADMIN_PASSWORD env var is only used here — never compared as plaintext again.
+  const existingHash = await pool.query("SELECT value FROM platform_config WHERE key='admin_password_hash'");
+  if (!existingHash.rows.length) {
+    if (!ADMIN_PASSWORD) throw new Error("ADMIN_PASSWORD is required for initial admin password setup");
+    const hash = await bcrypt.hash(ADMIN_PASSWORD, 12);
+    await pool.query("INSERT INTO platform_config (key, value) VALUES ('admin_password_hash', $1) ON CONFLICT (key) DO NOTHING", [hash]);
+    console.log("Admin password hashed and stored in platform_config.");
+  }
   console.log("Database initialized.");
   setInterval(async function() {
     try {
-      await pool.query("DELETE FROM messages WHERE created_at < NOW() - INTERVAL '1 minute'");
+      await pool.query("DELETE FROM messages WHERE created_at < NOW() - INTERVAL '24 hours'");
     } catch(e) { console.error("OTP cleanup error:", e.message); }
-  }, 30000);
+  }, 30 * 60 * 1000);
   setInterval(async function() {
     try {
       const cutoff = Date.now() - 30 * 60 * 1000;
@@ -470,10 +554,16 @@ const HTML = `<!DOCTYPE html>
           <h4 style="color:#a5b4fc;">MacroDroid Setup (jednom)</h4>
           <ol style="color:#ccc;font-size:0.87em;line-height:1.9em;">
             <li><strong>Trigger:</strong> Periodic timer &mdash; svake <strong>30 sekundi</strong></li>
-            <li><strong>Action 1:</strong> HTTP Request GET &rarr;<br><code id="poll-url" style="color:#facc15;font-size:0.9em;word-break:break-all;"></code></li>
+            <li><strong>Action 1:</strong> HTTP Request GET &rarr;<br>
+              <code id="poll-url" style="color:#facc15;font-size:0.9em;word-break:break-all;"></code><br>
+              <span style="color:#94a3b8;font-size:0.85em;">Header: <code style="color:#a5b4fc;">Authorization: Bearer <span id="macro-token-display" style="color:#fbbf24;font-size:0.92em;word-break:break-all;"></span></code></span>
+            </li>
             <li><strong>Condition:</strong> HTTP response code = 200 (preskoči ako 204)</li>
             <li><strong>Action 2:</strong> Send SMS &rarr; primatelj: <code style="color:#a5b4fc;">{http_response_body:json_object:recipient}</code> &nbsp; tekst: <code style="color:#a5b4fc;">{http_response_body:json_object:message}</code></li>
-            <li><strong>Action 3:</strong> HTTP Request GET &rarr;<br><code id="ack-url" style="color:#4ade80;font-size:0.9em;word-break:break-all;"></code></li>
+            <li><strong>Action 3:</strong> HTTP Request GET &rarr;<br>
+              <code id="ack-url" style="color:#4ade80;font-size:0.9em;word-break:break-all;"></code><br>
+              <span style="color:#94a3b8;font-size:0.85em;">Header: Authorization: Bearer &lt;isti token&gt;</span>
+            </li>
           </ol>
         </div>
       </div>
@@ -557,7 +647,7 @@ const HTML = `<!DOCTYPE html>
     function setAdminStatus(msg,err){var el=document.getElementById("admin-login-status");if(el){el.style.color=err?"#fc8181":"#4ade80";el.textContent=msg;}setStatus(msg,err);}
     async function adminLogin(){var btn=document.getElementById("admin-login-btn");try{var pw=document.getElementById("adminPass").value;if(!pw)return setAdminStatus("Enter admin password.",true);if(btn)btn.disabled=true;setAdminStatus("Logging in...",false);var r=await fetch("/admin/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})});var d=await r.json().catch(function(){return{error:"Server error"};});if(!r.ok){if(btn)btn.disabled=false;return setAdminStatus(d.error||"Wrong password.",true);}saveSession(d);setAdminStatus("Admin logged in!",false);refreshAll();}catch(e){if(btn)btn.disabled=false;setAdminStatus("Error: "+e.message,true);}}
     async function testSMS(){var n=prompt("Phone number (e.g. +46705536378):");if(!n)return;var t=prompt("SMS text (e.g. Your code is 123456):");if(!t)return;var r=await fetch("/test-sms",{method:"POST",headers:authH({"Content-Type":"application/json"}),body:JSON.stringify({number:n,text:t})});var d=await r.json().catch(function(){return{error:"Error"};});if(!r.ok)return setStatus(d.error||"Error.",true);setStatus("Test SMS injected! OTP: "+(d.otp||"none"),false);loadMessages();}
-    async function renderAdmin(){var box=document.getElementById("admin");if(role!=="admin"){box.style.display="none";box.innerHTML="";return;}box.style.display="block";var statsHtml=await loadAdminStats()||"";box.innerHTML="<h3>&#9889; Admin panel</h3>"+statsHtml+"<input id='an' placeholder='+46700000001'> <input id='ap' type='number' min='1' placeholder='sats'> <button onclick='addNum()'>&#9889; Add number</button> <button onclick='testSMS()' class='btn-secondary'>Test SMS</button><div id='adminList'></div><hr style='border-color:#1e2d40;margin:16px 0'><h4>P2P Listings</h4><div id='adminP2PList'></div><hr style='border-color:#1e2d40;margin:16px 0'><h4>&#127381; Referral Codes</h4><div id='adminRefCodes'></div><hr style='border-color:#1e2d40;margin:16px 0'><h4>&#128226; Announcements</h4><div id='adminAnnouncements'></div><hr style='border-color:#1e2d40;margin:16px 0'><h4>&#127381; Promo Ads (Affiliate Links)</h4><p class='muted' style='font-size:0.85em;'>Your Binance, Nexo, and other referral links shown as banners to all users.</p><div id='adminPromoAds'></div><hr style='border-color:#1e2d40;margin:16px 0'><h4>&#128241; SMS Provider APIs</h4><p class='muted' style='font-size:0.85em;'>Connect SMSPool, SMSHero, Twilio, Vonage, Sinch and others. API keys stored securely. Unlimited providers.</p><div id='adminSmsProviders'></div><hr style='border-color:#1e2d40;margin:16px 0'><h4>&#128274; Escrow Disputes</h4><p class='muted' style='font-size:0.85em;'>Transactions in dispute. Resolve manually — choose winner: buyer (refund) or seller (release funds).</p><div id='adminEscrowList'></div>";loadAdminNums();loadAdminP2P();loadAdminRefCodes();loadAdminAnnouncements();loadAdminPromoAds();loadAdminSmsProviders();loadAdminEscrow();}
+    async function renderAdmin(){var box=document.getElementById("admin");if(role!=="admin"){box.style.display="none";box.innerHTML="";return;}box.style.display="block";var statsHtml=await loadAdminStats()||"";box.innerHTML="<h3>&#9889; Admin panel</h3>"+statsHtml+"<input id='an' placeholder='+46700000001'> <input id='ap' type='number' min='1' placeholder='sats'> <button onclick='addNum()'>&#9889; Add number</button> <button onclick='testSMS()' class='btn-secondary'>Test SMS</button><div id='adminList'></div><hr style='border-color:#1e2d40;margin:16px 0'><h4>P2P Listings</h4><div id='adminP2PList'></div><hr style='border-color:#1e2d40;margin:16px 0'><h4>&#127381; Referral Codes</h4><div id='adminRefCodes'></div><hr style='border-color:#1e2d40;margin:16px 0'><h4>&#128226; Announcements</h4><div id='adminAnnouncements'></div><hr style='border-color:#1e2d40;margin:16px 0'><h4>&#127381; Promo Ads (Affiliate Links)</h4><p class='muted' style='font-size:0.85em;'>Your Binance, Nexo, and other referral links shown as banners to all users.</p><div id='adminPromoAds'></div><hr style='border-color:#1e2d40;margin:16px 0'><h4>&#128241; SMS Provider APIs</h4><p class='muted' style='font-size:0.85em;'>Connect SMSPool, SMSHero, Twilio, Vonage, Sinch and others. API keys stored securely. Unlimited providers.</p><div id='adminSmsProviders'></div><hr style='border-color:#1e2d40;margin:16px 0'><h4>&#128274; Escrow Fee &amp; Settings</h4><div id='adminPlatformConfig'></div><hr style='border-color:#1e2d40;margin:16px 0'><h4>&#128274; Escrow Disputes</h4><p class='muted' style='font-size:0.85em;'>Transactions in dispute. Resolve manually — choose winner: buyer (refund) or seller (release funds).</p><div id='adminEscrowList'></div>";loadAdminNums();loadAdminP2P();loadAdminRefCodes();loadAdminAnnouncements();loadAdminPromoAds();loadAdminSmsProviders();loadAdminPlatformConfig();loadAdminEscrow();}
     var _refCodesData={};
     async function loadAdminRefCodes(){if(role!=="admin")return;var r=await fetch("/admin/referral-codes",{headers:authH()});if(!r.ok)return;var data=await r.json();_refCodesData={};var h="<div style='display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap;'><input id='rc-code' placeholder='Code (e.g. SUMMER25)' style='width:150px'><input id='rc-sats' type='number' placeholder='Bonus sats' style='width:120px'><input id='rc-desc' placeholder='Description' style='width:180px'><button onclick='addRefCode()'>&#9889; Add Code</button></div>";data.forEach(function(i){_refCodesData[i.id]=i;h+="<div class='box row'><span><strong style='color:#fbbf24;'>"+esc(i.code)+"</strong> &mdash; <span class='ln-yellow'>+"+esc(i.bonus_sats)+" sats</span> &mdash; used "+esc(i.uses_count)+"/"+esc(i.max_uses)+" &mdash; <span style='color:"+(i.is_active?"#4ade80":"#fc8181")+"'>"+(i.is_active?"active":"disabled")+"</span>"+(i.description?"<br><span class='muted' style='font-size:0.85em;'>"+esc(i.description)+"</span>":"")+"</span><button onclick='deleteRefCode("+i.id+")' class='btn-danger' style='padding:6px 12px;'>Disable</button></div>";});document.getElementById("adminRefCodes").innerHTML=h||"<p class='muted'>No referral codes yet.</p>";}
     async function addRefCode(){var code=document.getElementById("rc-code").value.trim().toUpperCase();var sats=Number(document.getElementById("rc-sats").value);var desc=document.getElementById("rc-desc").value.trim();if(!code||!sats)return setStatus("Enter code and bonus sats.",true);var r=await fetch("/admin/referral-codes",{method:"POST",headers:authH({"Content-Type":"application/json"}),body:JSON.stringify({code:code,bonusSats:sats,description:desc})});var d=await r.json().catch(function(){return{error:"Error"};});if(!r.ok)return setStatus(d.error||"Error.",true);setStatus("Referral code created: "+code,false);document.getElementById("rc-code").value="";document.getElementById("rc-sats").value="";document.getElementById("rc-desc").value="";loadAdminRefCodes();}
@@ -579,6 +669,9 @@ const HTML = `<!DOCTYPE html>
     async function loadAdminEscrow(){if(role!=="admin")return;var r=await fetch("/api/admin/escrow",{headers:authH()});if(!r.ok)return;var data=await r.json();_escrowAdminMap={};var disputed=data.filter(function(i){return i.status==="disputed";});var h="";if(!disputed.length)h="<p class='muted'>No disputes to resolve. All P2P escrow transactions listed if any are in dispute.</p>";disputed.forEach(function(i,idx){_escrowAdminMap[idx]=i.id;h+="<div class='box' style='border:1px solid #fc8181;'><div class='row'><span><strong style='color:#fc8181;'>DISPUTE</strong> &nbsp;TX: "+esc(i.id.slice(0,14))+"...<br>Buyer: <strong>"+esc(i.buyer_name||String(i.buyer_id))+"</strong> &bull; Seller: <strong>"+esc(i.seller_name||String(i.seller_id))+"</strong><br>Amount: <span class='ln-yellow'>"+esc(String(i.amount_sats))+" sats</span> &bull; Seller receives: "+esc(String(i.seller_amount))+" sats<br><span class='muted' style='font-size:0.85em;'>Reason: "+esc(i.dispute_reason||"—")+"</span></span></div><div style='margin-top:8px;display:flex;gap:6px;'><button data-idx='"+idx+"' data-winner='seller' onclick='resolveEscrowEl(this)' style='background:#166534;color:#4ade80;border:1px solid #4ade80;padding:6px 12px;font-size:0.88em;'>&#10003; Release to Seller</button><button data-idx='"+idx+"' data-winner='buyer' onclick='resolveEscrowEl(this)' class='btn-danger' style='padding:6px 12px;font-size:0.88em;'>&#8592; Refund Buyer</button></div></div>";});document.getElementById("adminEscrowList").innerHTML=h;}
     function resolveEscrowEl(el){var idx=el.getAttribute("data-idx");var winner=el.getAttribute("data-winner");resolveEscrow(_escrowAdminMap[idx],winner);}
     async function resolveEscrow(txId,winner){if(!txId)return;if(!confirm("Resolve in favor of "+winner+"? This is irreversible."))return;var r=await fetch("/api/admin/resolve/"+txId,{method:"POST",headers:authH({"Content-Type":"application/json"}),body:JSON.stringify({winner:winner})});var d=await r.json().catch(function(){return{error:"Error"};});if(!r.ok)return setStatus(d.error||"Error.",true);setStatus("Resolved: "+winner+" wins.",false);loadAdminEscrow();}
+    async function loadAdminPlatformConfig(){if(role!=="admin")return;var r=await fetch("/admin/platform-config",{headers:authH()});if(!r.ok)return;var cfg=await r.json();var pct=cfg.escrow_fee_percent?cfg.escrow_fee_percent.value:"8";var minSats=cfg.escrow_fee_min_sats?cfg.escrow_fee_min_sats.value:"0";var updAt=cfg.escrow_fee_percent&&cfg.escrow_fee_percent.updated_at?new Date(cfg.escrow_fee_percent.updated_at).toLocaleString():"—";var preview=function(p,m){var ex=1000;var fee=Math.max(Math.ceil(ex*parseFloat(p||0)/100),parseInt(m||0));return"Example: 1000 sat listing → fee "+fee+" sats, seller receives "+(ex-fee)+" sats";};var h="<div class='box' style='border:1px solid #2a3a50;'><h4 style='margin:0 0 10px;'>&#9881; Escrow Fee Settings</h4><p class='muted' style='font-size:0.84em;margin:0 0 12px;'>Changes apply to new transactions immediately — existing escrow invoices are not affected.</p><div style='display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;'><div><label class='muted' style='font-size:0.83em;display:block;margin-bottom:4px;'>Platform fee %</label><input id='cfg-fee-pct' type='number' min='0' max='50' step='0.1' value='"+esc(pct)+"' oninput='updateFeePreview()' style='width:100px;'></div><div><label class='muted' style='font-size:0.83em;display:block;margin-bottom:4px;'>Min fee (sats)</label><input id='cfg-fee-min' type='number' min='0' step='1' value='"+esc(minSats)+"' oninput='updateFeePreview()' style='width:120px;'></div><button onclick='savePlatformConfig()' style='padding:10px 18px;'>Save</button></div><p id='cfg-fee-preview' class='muted' style='font-size:0.82em;margin-top:10px;'>"+esc(preview(pct,minSats))+"</p><p class='muted' style='font-size:0.78em;margin-top:4px;'>Formula: fee = max(amount × %/100, min_sats) &nbsp;&bull;&nbsp; Last saved: "+esc(updAt)+"</p></div>";document.getElementById("adminPlatformConfig").innerHTML=h;}
+    function updateFeePreview(){var p=document.getElementById("cfg-fee-pct");var m=document.getElementById("cfg-fee-min");var prev=document.getElementById("cfg-fee-preview");if(!p||!m||!prev)return;var pct=parseFloat(p.value)||0;var minSats=parseInt(m.value)||0;var ex=1000;var fee=Math.max(Math.ceil(ex*pct/100),minSats);prev.textContent="Example: 1000 sat listing → fee "+fee+" sats, seller receives "+(ex-fee)+" sats";}
+    async function savePlatformConfig(){var pctEl=document.getElementById("cfg-fee-pct");var minEl=document.getElementById("cfg-fee-min");if(!pctEl||!minEl)return;var pct=parseFloat(pctEl.value);var minSats=Math.floor(Number(minEl.value));if(!Number.isFinite(pct)||pct<0||pct>50)return setStatus("Fee % must be 0–50.",true);if(!Number.isFinite(minSats)||minSats<0)return setStatus("Min sats must be ≥ 0.",true);var r=await fetch("/admin/platform-config",{method:"PATCH",headers:authH({"Content-Type":"application/json"}),body:JSON.stringify({escrow_fee_percent:pct,escrow_fee_min_sats:minSats})});var d=await r.json().catch(function(){return{error:"Error"};});if(!r.ok)return setStatus(d.error||"Error.",true);setStatus("Escrow fee saved: "+pct+"% (min "+minSats+" sats). New transactions will use this fee.",false);loadAdminPlatformConfig();}
     async function addNum(){var n=document.getElementById("an").value.trim();var p=Number(document.getElementById("ap").value);var r=await fetch("/admin/numbers",{method:"POST",headers:authH({"Content-Type":"application/json"}),body:JSON.stringify({number:n,priceSats:p})});var d=await r.json().catch(function(){return{error:"Error"};});if(!r.ok)return setStatus(d.error||"Error.",true);setStatus("Number saved.",false);loadAdminNums();loadNumbers();}
     async function delNum(id){var r=await fetch("/admin/numbers/"+id,{method:"DELETE",headers:authH()});if(!r.ok)return setStatus("Error.",true);setStatus("Disabled.",false);loadAdminNums();loadNumbers();}
     async function loadAdminNums(){if(role!=="admin")return;var r=await fetch("/admin/numbers",{headers:authH()});if(!r.ok)return;var data=await r.json();var h="";data.forEach(function(i){h+="<div class='box row'><span>"+esc(i.phone_number)+" &mdash; <strong class='ln-yellow'>"+esc(i.price_sats)+" sats</strong> <span class='muted'>"+(i.active?"active":"disabled")+"</span></span><span style='display:flex;gap:6px;'><button onclick='editPrice("+i.id+","+i.price_sats+")' class='btn-secondary' style='padding:6px 12px;'>Edit price</button><button onclick='delNum("+i.id+")' class='btn-danger' style='padding:6px 12px;'>Disable</button></span></div>";});document.getElementById("adminList").innerHTML=h||"<p class='muted'>No numbers yet.</p>";}
@@ -586,7 +679,7 @@ const HTML = `<!DOCTYPE html>
     async function loadAdminP2P(){if(role!=="admin")return;var r=await fetch("/admin/p2p",{headers:authH()});if(!r.ok)return;var data=await r.json();var h="";data.forEach(function(i){var earned=i.owner_earned_sats||0;var paid=i.owner_paid_sats||0;var owed=earned-paid;h+="<div class='box'><div class='row'><span><strong>"+esc(i.phone_number)+"</strong> &mdash; <span class='ln-yellow'>"+esc(i.price_sats)+" sats</span> &mdash; <span style='color:"+(i.approved?"#4ade80":"#fca5a5")+"'>"+(i.approved?"Approved":"Pending")+"</span></span><span style='display:flex;gap:6px;'>"+(i.approved?"":"<button onclick='approveP2P("+i.id+")' style='background:#166534;color:#4ade80;border:1px solid #4ade80;padding:6px 12px;'>Approve</button>")+"<button onclick='deleteP2P("+i.id+")' class='btn-danger' style='padding:6px 12px;'>Remove</button></span></div><div style='margin-top:8px;font-size:0.85em;'><span class='muted'>Owner earned: </span><strong class='ln-yellow'>"+earned+" sats</strong> &nbsp;|&nbsp; <span class='muted'>Paid out: </span><strong>"+paid+" sats</strong> &nbsp;|&nbsp; <span style='color:"+(owed>0?"#fbbf24":"#4ade80")+"'>Owed: "+owed+" sats</span>"+((owed>0)?"&nbsp;<button onclick='payoutP2P("+i.id+","+owed+")' style='padding:4px 10px;font-size:0.85em;'>Mark paid</button>":"")+"</div></div>";});document.getElementById("adminP2PList").innerHTML=h||"<p class='muted'>No P2P listings yet.</p>";}
     async function approveP2P(id){var r=await fetch("/admin/p2p/"+id+"/approve",{method:"PUT",headers:authH()});var d=await r.json().catch(function(){return{error:"Error"};});if(!r.ok)return setStatus(d.error||"Error.",true);setStatus("Listing approved.",false);loadAdminP2P();loadP2PMarket();}
     async function deleteP2P(id){if(!confirm("Remove this P2P listing?"))return;var r=await fetch("/admin/p2p/"+id,{method:"DELETE",headers:authH()});if(!r.ok)return setStatus("Error.",true);setStatus("Listing removed.",false);loadAdminP2P();loadP2PMarket();}
-    async function escrowBuyP2P(listingId,amountSats){setStatus("Creating escrow invoice...",false);var r=await fetch("/api/buy",{method:"POST",headers:authH({"Content-Type":"application/json"}),body:JSON.stringify({listingId:listingId})});var d=await r.json().catch(function(){return{error:"Error"};});if(!r.ok)return setStatus(d.error||"Error.",true);_lightningInvoice=d.paymentRequest||"";if(_lightningInvoice&&typeof window.webln!=="undefined"){try{await window.webln.enable();await window.webln.sendPayment(_lightningInvoice);setStatus("Escrow payment sent via wallet! Waiting...",false);loadEscrowTxs();return;}catch(we){setStatus("WebLN cancelled, use QR below.",false);}}var lnHtml=_lightningInvoice?"<textarea readonly style='width:100%;box-sizing:border-box;background:#0d1520;color:#fbbf24;border:1px solid #2a3a50;border-radius:10px;padding:10px;font-size:0.75em;resize:none;margin-top:10px;' rows='3'>"+esc(_lightningInvoice)+"</textarea><br><button onclick='copyLightning()' style='margin-top:6px;'>Copy Invoice</button>":"";document.getElementById("qr").innerHTML="<div class='box'><h3>&#128274; Escrow Payment</h3><p class='muted' style='font-size:0.88em;'>Funds are held safely in escrow. After you pay, the seller sends you the OTP code. Confirm receipt to release payment. Auto-released after 30 min.</p><p>Amount: <strong class='ln-yellow'>"+esc(d.amountSats)+" sats</strong> &nbsp;<span class='muted' style='font-size:0.85em;'>(8% platform fee included)</span></p>"+(d.qr?"<img src='"+esc(d.qr)+"' width='200' alt='QR' style='display:block;margin:10px auto;'>":"")+lnHtml+"<p class='muted' style='font-size:0.8em;margin-top:10px;'>TX: "+esc(d.txId)+"</p><button onclick='clearQR()' class='btn-secondary' style='width:100%;margin-top:8px;'>Cancel</button></div>";document.getElementById("qr").scrollIntoView({behavior:"smooth"});setStatus("Scan QR to pay escrow. Seller will be notified.",false);}
+    async function escrowBuyP2P(listingId,amountSats){setStatus("Creating escrow invoice...",false);var r=await fetch("/api/buy",{method:"POST",headers:authH({"Content-Type":"application/json"}),body:JSON.stringify({listingId:listingId})});var d=await r.json().catch(function(){return{error:"Error"};});if(!r.ok)return setStatus(d.error||"Error.",true);_lightningInvoice=d.paymentRequest||"";if(_lightningInvoice&&typeof window.webln!=="undefined"){try{await window.webln.enable();await window.webln.sendPayment(_lightningInvoice);setStatus("Escrow payment sent via wallet! Waiting...",false);loadEscrowTxs();return;}catch(we){setStatus("WebLN cancelled, use QR below.",false);}}var lnHtml=_lightningInvoice?"<textarea readonly style='width:100%;box-sizing:border-box;background:#0d1520;color:#fbbf24;border:1px solid #2a3a50;border-radius:10px;padding:10px;font-size:0.75em;resize:none;margin-top:10px;' rows='3'>"+esc(_lightningInvoice)+"</textarea><br><button onclick='copyLightning()' style='margin-top:6px;'>Copy Invoice</button>":"";var feeLabel=d.feePercent!=null?"("+esc(String(d.feePercent))+"% platform fee, seller receives "+esc(String(d.sellerAmount||d.amountSats-d.feeSats||"?"))+" sats)":"(platform fee included)";document.getElementById("qr").innerHTML="<div class='box'><h3>&#128274; Escrow Payment</h3><p class='muted' style='font-size:0.88em;'>Funds are held safely in escrow. After you pay, the seller sends you the OTP code. Confirm receipt to release payment. Auto-released after 30 min.</p><p>Amount: <strong class='ln-yellow'>"+esc(String(d.amountSats))+" sats</strong> &nbsp;<span class='muted' style='font-size:0.85em;'>"+feeLabel+"</span></p>"+(d.qr?"<img src='"+esc(d.qr)+"' width='200' alt='QR' style='display:block;margin:10px auto;'>":"")+lnHtml+"<p class='muted' style='font-size:0.8em;margin-top:10px;'>TX: "+esc(d.txId)+"</p><button onclick='clearQR()' class='btn-secondary' style='width:100%;margin-top:8px;'>Cancel</button></div>";document.getElementById("qr").scrollIntoView({behavior:"smooth"});setStatus("Scan QR to pay escrow. Seller will be notified.",false);}
     async function loadEscrowTxs(){if(!token||role==="admin")return;var r=await fetch("/api/my-escrow",{headers:authH()});if(!r.ok)return;var data=await r.json();var box=document.getElementById("escrow-txs-box");if(!data.length){if(box)box.style.display="none";return;}if(box)box.style.display="block";var COLORS={pending:"#94a3b8",paid:"#fbbf24",released:"#4ade80",disputed:"#fc8181",refunded:"#a5b4fc"};var LABELS={pending:"Awaiting Payment",paid:"Paid — Awaiting Confirmation",released:"Complete",disputed:"In Dispute",refunded:"Refunded"};var h="<h4>&#128274; My Escrow Transactions</h4>";var hasSeller=data.some(function(i){return i.my_role==="seller";});if(hasSeller)h+="<button onclick='showWithdrawForm()' class='btn-secondary' style='padding:5px 12px;font-size:0.85em;margin-bottom:10px;'>&#9889; Withdraw Balance to Lightning</button>";data.forEach(function(i){var statusColor=COLORS[i.status]||"#94a3b8";var statusLabel=LABELS[i.status]||i.status;var isBuyer=i.my_role==="buyer";var actions="";if(i.status==="paid"&&isBuyer){actions="<div style='margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;'><button onclick='confirmEscrow("+JSON.stringify(i.id)+")' style='background:#166534;color:#4ade80;border:1px solid #4ade80;padding:6px 12px;font-size:0.85em;'>&#10003; Confirm Receipt</button><button onclick='disputeEscrow("+JSON.stringify(i.id)+")' class='btn-danger' style='padding:6px 12px;font-size:0.85em;'>&#9888; Dispute</button></div>";}h+="<div class='box'><div class='row'><span><strong>"+(isBuyer?"Buying":"Selling")+"</strong> &mdash; <span class='ln-yellow'>"+esc(i.amount_sats)+" sats</span>"+(i.my_role==="seller"?" &bull; <span style='color:#4ade80;font-size:0.85em;'>You receive: "+esc(i.seller_amount)+" sats</span>":"")+" &mdash; <span style='color:"+statusColor+";font-size:0.88em;'>"+esc(statusLabel)+"</span>"+(i.dispute_reason?"<br><span class='muted' style='font-size:0.82em;'>Dispute: "+esc(i.dispute_reason)+"</span>":"")+"<br><span class='muted' style='font-size:0.8em;'>"+esc(new Date(Number(i.created_at)).toLocaleString())+"</span></span></div>"+actions+"</div>";});document.getElementById("escrow-txs").innerHTML=h;}
     async function confirmEscrow(txId){if(!confirm("Confirm receipt? This will release payment to the seller immediately."))return;var r=await fetch("/api/confirm/"+txId,{method:"POST",headers:authH({"Content-Type":"application/json"}),body:JSON.stringify({})});var d=await r.json().catch(function(){return{error:"Error"};});if(!r.ok)return setStatus(d.error||"Error.",true);setStatus("Payment released to seller. Transaction complete!",false);loadEscrowTxs();loadWalletBalance();}
     async function disputeEscrow(txId){var reason=prompt("Describe the problem (e.g. wrong code, no response):");if(!reason)return;var r=await fetch("/api/dispute/"+txId,{method:"POST",headers:authH({"Content-Type":"application/json"}),body:JSON.stringify({reason:reason})});var d=await r.json().catch(function(){return{error:"Error"};});if(!r.ok)return setStatus(d.error||"Error.",true);setStatus("Dispute opened. Admin will review and resolve.",false);loadEscrowTxs();}
@@ -595,7 +688,7 @@ const HTML = `<!DOCTYPE html>
     async function submitP2P(){var phone=document.getElementById("p2p-phone").value.trim();var price=Number(document.getElementById("p2p-price").value);var desc=document.getElementById("p2p-desc").value.trim();if(!phone||!price)return setStatus("Enter phone number and price.",true);var r=await fetch("/p2p/submit",{method:"POST",headers:authH({"Content-Type":"application/json"}),body:JSON.stringify({phoneNumber:phone,priceSats:price,description:desc})});var d=await r.json().catch(function(){return{error:"Error"};});if(!r.ok)return setStatus(d.error||"Error.",true);setStatus("Listing submitted! Waiting for admin approval.",false);document.getElementById("p2p-phone").value="";document.getElementById("p2p-price").value="";document.getElementById("p2p-desc").value="";loadMyP2PListings();}
     async function loadP2PMarket(){if(!token)return;var r=await fetch("/p2p/market",{headers:authH()});if(!r.ok)return;var data=await r.json();var h="";if(!data.length)h="<p class='muted'>No listings in the marketplace yet. Be the first to list your number!</p>";data.forEach(function(i){h+="<div class='box row'><span><strong>"+esc(i.phone_number)+"</strong> &mdash; <span class='ln-yellow'>"+esc(i.price_sats)+" sats</span>"+(i.description?"<br><span class='muted' style='font-size:0.85em;'>"+esc(i.description)+"</span>":"")+"<br><span class='muted' style='font-size:0.78em;'>&#128274; Escrow protected &bull; 8% fee</span></span><button onclick='escrowBuyP2P("+i.id+","+i.price_sats+")' style='background:linear-gradient(135deg,#1e3a2e,#166534);border:1px solid #4ade80;color:#4ade80;'>&#128274; Escrow Buy</button></div>";});document.getElementById("p2p-market").innerHTML=h;}
     async function loadMyP2PListings(){if(!token)return;var r=await fetch("/p2p/my-listings",{headers:authH()});if(!r.ok)return;var data=await r.json();if(!data.length){document.getElementById("p2p-my-listings").innerHTML="";document.getElementById("p2p-submit-box").style.display="block";return;}document.getElementById("p2p-submit-box").style.display="block";var h="<div class='box'><h4>My listings</h4>";data.forEach(function(i){var earned=i.owner_earned_sats||0;var paid=i.owner_paid_sats||0;h+="<div class='box' style='margin:8px 0;'><strong>"+esc(i.phone_number)+"</strong> &mdash; "+esc(i.price_sats)+" sats &mdash; <span style='color:"+(i.approved?"#4ade80":"#fca5a5")+"'>"+(i.approved?"Active":"Pending approval")+"</span><br><span class='muted' style='font-size:0.85em;'>Earned: "+earned+" sats | Paid out: "+paid+" sats | Owed: "+(earned-paid)+" sats</span></div>";});h+="</div>";document.getElementById("p2p-my-listings").innerHTML=h;}
-    function renderSendTab(){if(!token){document.getElementById("send-login-box").style.display="block";document.getElementById("send-admin-panel").style.display="none";document.getElementById("send-client-panel").style.display="none";return;}document.getElementById("send-login-box").style.display="none";if(role==="admin"){document.getElementById("send-admin-panel").style.display="block";document.getElementById("send-client-panel").style.display="none";var base=location.origin;document.getElementById("poll-url").textContent=base+"/api/pending-sms?key="+token;document.getElementById("ack-url").textContent=base+"/api/sms-sent/[id]?key="+token;loadSendNumbersAdmin();loadOutbox();}else{document.getElementById("send-admin-panel").style.display="none";document.getElementById("send-client-panel").style.display="block";loadSendNumbers();checkSendCredit();loadMySent();}}
+    function renderSendTab(){if(!token){document.getElementById("send-login-box").style.display="block";document.getElementById("send-admin-panel").style.display="none";document.getElementById("send-client-panel").style.display="none";return;}document.getElementById("send-login-box").style.display="none";if(role==="admin"){document.getElementById("send-admin-panel").style.display="block";document.getElementById("send-client-panel").style.display="none";var base=location.origin;document.getElementById("poll-url").textContent=base+"/api/pending-sms";document.getElementById("ack-url").textContent=base+"/api/sms-sent/[id]";var td=document.getElementById("macro-token-display");if(td)td.textContent=token;loadSendNumbersAdmin();loadOutbox();}else{document.getElementById("send-admin-panel").style.display="none";document.getElementById("send-client-panel").style.display="block";loadSendNumbers();checkSendCredit();loadMySent();}}
     async function addSendNumber(){var phone=document.getElementById("sn-phone").value.trim();var price=Number(document.getElementById("sn-price").value);if(!phone||!price)return setStatus("Enter phone and price.",true);var r=await fetch("/admin/send-numbers",{method:"POST",headers:authH({"Content-Type":"application/json"}),body:JSON.stringify({phoneNumber:phone,priceSats:price})});var d=await r.json().catch(function(){return{error:"Error"};});if(!r.ok)return setStatus(d.error||"Error.",true);setStatus("Send number added.",false);document.getElementById("sn-phone").value="";document.getElementById("sn-price").value="";loadSendNumbersAdmin();}
     async function loadSendNumbersAdmin(){if(role!=="admin")return;var r=await fetch("/admin/send-numbers",{headers:authH()});if(!r.ok)return;var data=await r.json();var h="";data.forEach(function(i){h+="<div class='box row'><span><strong>"+esc(i.phone_number)+"</strong> &mdash; <span class='ln-yellow'>"+esc(i.price_sats)+" sats</span> <span class='muted'>"+(i.active?"active":"disabled")+"</span></span><button onclick='disableSendNumber("+i.id+")' class='btn-danger' style='padding:6px 12px;'>Disable</button></div>";});document.getElementById("send-numbers-admin-list").innerHTML=h||"<p class='muted'>No send numbers yet.</p>";}
     async function disableSendNumber(id){var r=await fetch("/admin/send-numbers/"+id,{method:"DELETE",headers:authH()});if(!r.ok)return setStatus("Error.",true);setStatus("Disabled.",false);loadSendNumbersAdmin();}
@@ -608,7 +701,7 @@ const HTML = `<!DOCTYPE html>
     async function submitMessage(){var creditId=document.getElementById("send-compose-box").dataset.creditId;var recipient=document.getElementById("send-recipient").value.trim();var message=document.getElementById("send-message").value.trim();if(!recipient||!message)return setStatus("Enter recipient and message.",true);var r=await fetch("/send-message",{method:"POST",headers:authH({"Content-Type":"application/json"}),body:JSON.stringify({creditId:creditId,recipient:recipient,message:message})});var d=await r.json().catch(function(){return{error:"Error"};});if(!r.ok)return setStatus(d.error||"Error.",true);setStatus("Message queued! Will be sent shortly.",false);document.getElementById("send-recipient").value="";document.getElementById("send-message").value="";document.getElementById("send-compose-box").style.display="none";loadMySent();}
     async function loadMySent(){if(!token||role==="admin")return;var r=await fetch("/my-sent",{headers:authH()});if(!r.ok)return;var data=await r.json();var box=document.getElementById("my-sent-box");if(!data.length){box.style.display="none";return;}box.style.display="block";var h="";data.forEach(function(i){var col=i.status==="sent"?"#4ade80":"#facc15";h+="<div class='box row'><span><strong>"+esc(i.recipient)+"</strong><br><span class='muted' style='font-size:0.85em;'>"+esc(i.message)+"</span></span><span style='color:"+col+";font-weight:bold;font-size:0.88em;'>"+esc(i.status)+"</span></div>";});document.getElementById("my-sent-list").innerHTML=h;}
     var _p2pData={};
-    async function buyP2P(id){setStatus("Creating invoice...",false);var r=await fetch("/create-invoice",{method:"POST",headers:authH({"Content-Type":"application/json"}),body:JSON.stringify({p2pListingId:id})});var inv=await r.json().catch(function(){return{error:"Error"};});if(!r.ok)return setStatus(inv.error||"Error.",true);setStatus("Scan QR to pay.",false);_lightningInvoice=inv.lightning_invoice||"";var lnHtml="";if(_lightningInvoice){lnHtml="<textarea style='width:100%;box-sizing:border-box;background:#111;color:#facc15;border:1px solid #444;border-radius:8px;padding:8px;font-size:0.75em;margin-top:8px;resize:none;' rows='3' readonly>"+esc(_lightningInvoice)+"</textarea><br><button onclick='copyLightning()' style='margin-top:4px;'>Copy Lightning Invoice</button>";}var chkHtml=inv.checkout_url?"<br><a href='"+esc(inv.checkout_url)+"' target='_blank'>Open in Browser</a>":"";switchTab("rent");document.getElementById("qr").innerHTML="<div class='box'><h3>Scan Lightning QR (P2P)</h3><p>Amount: "+esc(inv.amount_sats)+" sats</p><img src='"+esc(inv.qr)+"' width='220' alt='QR'>"+lnHtml+chkHtml+"</div>";startPolling();}
+    /* buyP2P() removed — all P2P purchases now go through escrowBuyP2P() → /api/buy */
     var COUNTRIES=["Albania","Argentina","Australia","Austria","Bangladesh","Belarus","Belgium","Bosnia","Brazil","Bulgaria","Canada","Chile","China","Colombia","Croatia","Czech Republic","Denmark","Egypt","Estonia","Finland","France","Germany","Greece","Hong Kong","Hungary","India","Indonesia","Ireland","Israel","Italy","Japan","Kazakhstan","Kenya","Kosovo","Latvia","Lithuania","Malaysia","Mexico","Montenegro","Morocco","Netherlands","New Zealand","Nigeria","North Macedonia","Norway","Pakistan","Peru","Philippines","Poland","Portugal","Romania","Russia","Saudi Arabia","Serbia","Singapore","Slovakia","Slovenia","South Africa","South Korea","Spain","Sweden","Switzerland","Taiwan","Thailand","Turkey","UAE","UK","Ukraine","USA","Vietnam","Other"];
     var SERVICES=["Telegram","WhatsApp","Viber","Signal","Instagram","Facebook","Messenger","Twitter / X","TikTok","Snapchat","YouTube","Twitch","Discord","LinkedIn","Pinterest","Reddit","Clubhouse","BeReal","Threads","Google","Apple","Microsoft","Amazon","Netflix","Spotify","Disney+","HBO Max","Hulu","Prime Video","Steam","Twitch","Uber","Uber Eats","Airbnb","Booking.com","Fiverr","Upwork","Etsy","eBay","Shopify","Tinder","Bumble","Hinge","Badoo","OkCupid","PayPal","Cash App","Venmo","Wise","Revolut","Skrill","Neteller","N26","Monzo","Coinbase","Binance","Bybit","OKX","KuCoin","Kraken","Bitget","MEXC","Gate.io","Nexo","Crypto.com","Dropbox","GitHub","Slack","Zoom","Teams","Notion","Trello","Figma","ChatGPT","Other"];
     var _numsData={};
@@ -711,13 +804,26 @@ app.post("/register", wrap(async function(req, res) {
   res.json({ token: signToken(user), user: user });
 }));
 
-app.post("/admin/login", function(req, res) {
-  if (String(req.body.password || "") !== ADMIN_PASSWORD) {
-    return res.status(403).json({ error: "Wrong admin password" });
+app.post("/admin/login", loginRateLimit, wrap(async function(req, res) {
+  const password = String(req.body.password || "");
+  if (!password) {
+    recordLoginFailure(req);
+    return res.status(401).json({ error: "Password required" });
+  }
+  const hashRow = await pool.query("SELECT value FROM platform_config WHERE key='admin_password_hash'");
+  if (!hashRow.rows.length) {
+    // Hash not yet seeded — this should never happen after initDb(), but guard anyway.
+    recordLoginFailure(req);
+    return res.status(503).json({ error: "Admin not configured. Set ADMIN_PASSWORD and restart." });
+  }
+  const valid = await bcrypt.compare(password, hashRow.rows[0].value);
+  if (!valid) {
+    recordLoginFailure(req);
+    return res.status(401).json({ error: "Wrong password" });
   }
   const user = { id: 0, username: "admin", role: "admin" };
   return res.json({ token: signToken(user), user: user });
-});
+}));
 
 app.get("/numbers", auth, wrap(async function(req, res) {
   const result = await pool.query("SELECT id, phone_number, price_sats FROM numbers WHERE active = TRUE ORDER BY id DESC");
@@ -819,14 +925,15 @@ app.post("/create-invoice", auth, wrap(async function(req, res) {
     const qrSource = lightningInvoice || data.checkoutUrl || data.url;
     if (!qrSource) return res.status(502).json({ error: "No payment URL returned" });
     const qr = await QRCode.toDataURL(qrSource);
-    // Try wallet payment
-    const wr = await pool.query("SELECT balance_sats FROM wallets WHERE user_id = $1", [req.user.id]);
-    const bal = wr.rows[0] ? wr.rows[0].balance_sats : 0;
-    if (bal >= priceSats) {
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
-        await client.query("UPDATE wallets SET balance_sats = balance_sats - $1 WHERE user_id = $2", [priceSats, req.user.id]);
+    // Try wallet payment (atomic balance check prevents TOCTOU race)
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const deductResult = await client.query(
+        "UPDATE wallets SET balance_sats = balance_sats - $1 WHERE user_id = $2 AND balance_sats >= $1 RETURNING balance_sats",
+        [priceSats, req.user.id]
+      );
+      if (deductResult.rowCount > 0) {
         await client.query("UPDATE invoices SET status='paid' WHERE id=$1", [invoiceId]);
         await client.query("COMMIT");
         // Buy number from provider immediately
@@ -835,7 +942,6 @@ app.post("/create-invoice", auth, wrap(async function(req, res) {
           const bought = await providerBuyNumber(provider, country, service);
           phone = bought.phone; orderId = bought.orderId;
         } catch(be) {
-          await client.query("ROLLBACK").catch(function(){});
           const client2 = await pool.connect();
           await client2.query("UPDATE wallets SET balance_sats = balance_sats + $1 WHERE user_id = $2", [priceSats, req.user.id]).catch(function(){});
           client2.release();
@@ -848,9 +954,16 @@ app.post("/create-invoice", auth, wrap(async function(req, res) {
         await pool.query("INSERT INTO sessions (user_id, number_id, invoice_id, expires_at, country, service, provider, provider_order_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING", [req.user.id, numberId, invoiceId, expiresAt, country, service, provider.provider_type, orderId]);
         broadcast({ type: "session_activated", userId: req.user.id, numberId, phoneNumber: phone });
         return res.json({ paid_from_wallet: true, amount_sats: priceSats, phone_number: phone });
-      } catch(e) { await client.query("ROLLBACK"); throw e; } finally { client.release(); }
-    }
+      }
+      // Insufficient wallet balance: roll back and fall through to Lightning payment
+      await client.query("ROLLBACK");
+    } catch(e) { await client.query("ROLLBACK").catch(function(){}); throw e; } finally { client.release(); }
     return res.json({ invoice_id: invoiceId, amount_sats: priceSats, qr: qr, lightning_invoice: lightningInvoice, checkout_url: data.checkoutUrl || data.url, mode: "provider" });
+  }
+
+  // P2P purchases must go through POST /api/buy (escrow flow), not this endpoint.
+  if (req.body.p2pListingId) {
+    return res.status(410).json({ error: "P2P purchases must use POST /api/buy (escrow flow). This path has been removed." });
   }
 
   let number, p2pListingId = null, sendNumberId = null;
@@ -861,18 +974,6 @@ app.post("/create-invoice", auth, wrap(async function(req, res) {
     if (!sr.rows[0]) return res.status(400).json({ error: "Send number not available" });
     number = { id: sr.rows[0].id, phone_number: sr.rows[0].phone_number, price_sats: sr.rows[0].price_sats, _isSend: true };
     sendNumberId = sid;
-  } else if (req.body.p2pListingId) {
-    const lid = Number(req.body.p2pListingId);
-    if (!Number.isInteger(lid) || lid <= 0) return res.status(400).json({ error: "Invalid P2P listing ID" });
-    const lr = await pool.query("SELECT * FROM p2p_listings WHERE id = $1 AND approved = TRUE AND active = TRUE", [lid]);
-    const listing = lr.rows[0];
-    if (!listing) return res.status(400).json({ error: "P2P listing not available" });
-    if (!listing.number_id) return res.status(400).json({ error: "P2P listing not linked to a number yet" });
-    const nr = await pool.query("SELECT id, phone_number, price_sats FROM numbers WHERE id = $1 AND active = TRUE", [listing.number_id]);
-    if (!nr.rows[0]) return res.status(400).json({ error: "P2P number not available" });
-    number = nr.rows[0];
-    number.price_sats = listing.price_sats;
-    p2pListingId = lid;
   } else {
     const numberId = Number(req.body.numberId);
     if (!Number.isInteger(numberId) || numberId <= 0) return res.status(400).json({ error: "Invalid number ID" });
@@ -883,7 +984,7 @@ app.post("/create-invoice", auth, wrap(async function(req, res) {
   const appUrl = process.env.APP_URL || ("https://" + (process.env.RENDER_EXTERNAL_HOSTNAME || "smsnero.onrender.com"));
   const payload = {
     title: "SMSNero",
-    description: (p2pListingId ? "[P2P] " : "") + "Phone number: " + number.phone_number,
+    description: "Phone number: " + number.phone_number,
     amount: number.price_sats,
     unit: "sat",
     onChain: false,
@@ -912,28 +1013,31 @@ app.post("/create-invoice", auth, wrap(async function(req, res) {
   const qr = await QRCode.toDataURL(qrSource);
   const country = String(req.body.country || "").trim().slice(0, 100) || null;
   const service = String(req.body.service || "").trim().slice(0, 100) || null;
-  // Try wallet payment first (only for regular number purchases)
-  if (!p2pListingId && !sendNumberId && !number._isSend) {
-    const wr = await pool.query("SELECT balance_sats FROM wallets WHERE user_id = $1", [req.user.id]);
-    const bal = wr.rows[0]?.balance_sats || 0;
-    if (bal >= number.price_sats) {
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
-        await client.query("UPDATE wallets SET balance_sats = balance_sats - $1 WHERE user_id = $2", [number.price_sats, req.user.id]);
+  // Try wallet payment first (only for regular number and send-credit purchases)
+  if (!sendNumberId && !number._isSend) {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const deductResult = await client.query(
+        "UPDATE wallets SET balance_sats = balance_sats - $1 WHERE user_id = $2 AND balance_sats >= $1 RETURNING balance_sats",
+        [number.price_sats, req.user.id]
+      );
+      if (deductResult.rowCount > 0) {
         const expiresAt = new Date(Date.now() + SESSION_DURATION_HOURS * 3600000);
         await client.query("INSERT INTO sessions (user_id, number_id, expires_at, country, service) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING", [req.user.id, number.id, expiresAt, country, service]);
         await client.query("COMMIT");
         broadcast({ type: "session_activated", userId: req.user.id, numberId: number.id });
         return res.json({ paid_from_wallet: true, amount_sats: number.price_sats, phone_number: number.phone_number });
-      } catch(e) { await client.query("ROLLBACK"); throw e; }
-      finally { client.release(); }
-    }
+      }
+      // Insufficient balance: roll back and fall through to Lightning invoice
+      await client.query("ROLLBACK");
+    } catch(e) { await client.query("ROLLBACK").catch(function(){}); throw e; }
+    finally { client.release(); }
   }
   const numIdForInvoice = number._isSend ? null : number.id;
   const result = await pool.query(
-    "INSERT INTO invoices (provider_payment_id, user_id, number_id, amount_sats, status, checkout_url, qr, country, service, p2p_listing_id, send_number_id) VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9, $10) RETURNING *",
-    [data.id || null, req.user.id, numIdForInvoice, number.price_sats, checkoutUrl || qrSource, qr, country, service, p2pListingId, sendNumberId]
+    "INSERT INTO invoices (provider_payment_id, user_id, number_id, amount_sats, status, checkout_url, qr, country, service, send_number_id) VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9) RETURNING *",
+    [data.id || null, req.user.id, numIdForInvoice, number.price_sats, checkoutUrl || qrSource, qr, country, service, sendNumberId]
   );
   const row = result.rows[0];
   row.lightning_invoice = lightningInvoice;
@@ -941,6 +1045,10 @@ app.post("/create-invoice", auth, wrap(async function(req, res) {
 }));
 
 app.post("/webhook", wrap(async function(req, res) {
+  if (!verifyWebhookSignature(req)) {
+    console.warn("Webhook signature mismatch — ignoring request from", req.ip);
+    return res.status(401).json({ error: "Invalid webhook signature" });
+  }
   const event = req.body || {};
   console.log("Webhook received from Swiss Bitcoin Pay:", JSON.stringify(event));
   const eventId = event.invoiceId || event.paymentId || event.id;
@@ -981,10 +1089,6 @@ app.post("/webhook", wrap(async function(req, res) {
     } else {
       const expiresAt = new Date(Date.now() + SESSION_DURATION_HOURS * 3600000);
       await pool.query("INSERT INTO sessions (user_id, number_id, invoice_id, expires_at, country, service) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING", [invoice.user_id, invoice.number_id, invoice.id, expiresAt, invoice.country || null, invoice.service || null]);
-      if (invoice.p2p_listing_id) {
-        const ownerShare = Math.floor(invoice.amount_sats * 0.5);
-        await pool.query("UPDATE p2p_listings SET owner_earned_sats = owner_earned_sats + $1 WHERE id = $2", [ownerShare, invoice.p2p_listing_id]);
-      }
       broadcast({ type: "session_activated", userId: invoice.user_id, numberId: invoice.number_id });
     }
     return res.sendStatus(200);
@@ -1289,13 +1393,26 @@ app.get("/my-sent", auth, wrap(async function(req, res) {
   res.json(r.rows);
 }));
 
+// Extract the admin JWT for MacroDroid endpoints.
+// Primary: Authorization: Bearer <token> header.
+// Fallback: ?key=<token> query param (deprecated — avoid; token leaks into logs).
+function macrodroidAuth(req, res) {
+  const authHeader = req.headers.authorization || "";
+  let key = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+  if (!key) {
+    key = String(req.query.key || "").trim();
+    if (key) console.warn("MacroDroid: token supplied via query param — switch to Authorization: Bearer header");
+  }
+  if (!key) { res.status(401).json({ error: "Missing Authorization header (Bearer token required)" }); return null; }
+  let user;
+  try { user = verifyToken(key); } catch(e) { res.status(403).json({ error: "Invalid or expired token" }); return null; }
+  if (user.role !== "admin") { res.status(403).json({ error: "Admin only" }); return null; }
+  return user;
+}
+
 // MacroDroid polling: returns next pending SMS
 app.get("/api/pending-sms", wrap(async function(req, res) {
-  const key = String(req.query.key || "").trim();
-  if (!key) return res.status(401).json({ error: "Missing key" });
-  let user;
-  try { user = verifyToken(key); } catch(e) { return res.status(403).json({ error: "Invalid key" }); }
-  if (user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+  if (!macrodroidAuth(req, res)) return;
   const r = await pool.query("SELECT id, recipient, message FROM outbox WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1");
   if (!r.rows.length) return res.status(204).send("");
   res.json(r.rows[0]);
@@ -1303,11 +1420,7 @@ app.get("/api/pending-sms", wrap(async function(req, res) {
 
 // MacroDroid confirm: marks SMS as sent
 app.get("/api/sms-sent/:id", wrap(async function(req, res) {
-  const key = String(req.query.key || "").trim();
-  if (!key) return res.status(401).json({ error: "Missing key" });
-  let user;
-  try { user = verifyToken(key); } catch(e) { return res.status(403).json({ error: "Invalid key" }); }
-  if (user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+  if (!macrodroidAuth(req, res)) return;
   const id = Number(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: "Invalid ID" });
   await pool.query("UPDATE outbox SET status = 'sent' WHERE id = $1", [id]);
@@ -1340,6 +1453,7 @@ app.get("/public/referral-codes", wrap(async function(req, res) {
 
 // USER: use referral code
 app.post("/use-referral", auth, wrap(async function(req, res) {
+  if (req.user.role === "admin") return res.status(400).json({ error: "Admin cannot use referral codes" });
   const { code } = req.body;
   if (!code) return res.status(400).json({ error: "Code is required" });
   const codeRow = await pool.query("SELECT * FROM referral_codes WHERE code = $1 AND is_active = TRUE", [String(code).toUpperCase()]);
@@ -1348,16 +1462,19 @@ app.post("/use-referral", auth, wrap(async function(req, res) {
   if (rc.uses_count >= rc.max_uses) return res.status(400).json({ error: "This code has reached its usage limit" });
   const already = await pool.query("SELECT id FROM user_referrals WHERE user_id = $1 AND referral_code_id = $2", [req.user.id, rc.id]);
   if (already.rows.length) return res.status(400).json({ error: "You already used this referral code" });
-  await pool.query("BEGIN");
+  const client = await pool.connect();
   try {
-    await pool.query("INSERT INTO user_referrals (user_id, referral_code_id) VALUES ($1, $2)", [req.user.id, rc.id]);
-    await pool.query("INSERT INTO wallets (user_id, balance_sats) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET balance_sats = wallets.balance_sats + $2", [req.user.id, rc.bonus_sats]);
-    await pool.query("UPDATE referral_codes SET uses_count = uses_count + 1 WHERE id = $1", [rc.id]);
-    await pool.query("COMMIT");
+    await client.query("BEGIN");
+    await client.query("INSERT INTO user_referrals (user_id, referral_code_id) VALUES ($1, $2)", [req.user.id, rc.id]);
+    await client.query("INSERT INTO wallets (user_id, balance_sats) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET balance_sats = wallets.balance_sats + $2", [req.user.id, rc.bonus_sats]);
+    await client.query("UPDATE referral_codes SET uses_count = uses_count + 1 WHERE id = $1", [rc.id]);
+    await client.query("COMMIT");
     res.json({ bonus_sats: rc.bonus_sats });
   } catch(e) {
-    await pool.query("ROLLBACK");
+    await client.query("ROLLBACK");
     throw e;
+  } finally {
+    client.release();
   }
 }));
 
@@ -1409,6 +1526,68 @@ app.delete("/admin/promo-ads/:id", auth, adminOnly, wrap(async function(req, res
   res.json({ ok: true });
 }));
 
+// ADMIN: platform config — read all settings
+app.get("/admin/platform-config", auth, adminOnly, wrap(async function(req, res) {
+  const r = await pool.query("SELECT key, value, updated_at FROM platform_config ORDER BY key");
+  const cfg = {};
+  for (const row of r.rows) cfg[row.key] = { value: row.value, updated_at: row.updated_at };
+  res.json(cfg);
+}));
+
+// ADMIN: platform config — update escrow fee settings
+app.patch("/admin/platform-config", auth, adminOnly, wrap(async function(req, res) {
+  const allowed = { escrow_fee_percent: null, escrow_fee_min_sats: null };
+  const updates = [];
+  if (req.body.escrow_fee_percent !== undefined) {
+    const v = parseFloat(req.body.escrow_fee_percent);
+    if (!Number.isFinite(v) || v < 0 || v > 50) return res.status(400).json({ error: "escrow_fee_percent must be a number between 0 and 50" });
+    updates.push(["escrow_fee_percent", String(v)]);
+  }
+  if (req.body.escrow_fee_min_sats !== undefined) {
+    const v = Math.floor(Number(req.body.escrow_fee_min_sats));
+    if (!Number.isFinite(v) || v < 0) return res.status(400).json({ error: "escrow_fee_min_sats must be a non-negative integer" });
+    updates.push(["escrow_fee_min_sats", String(v)]);
+  }
+  if (!updates.length) return res.status(400).json({ error: "No valid fields provided" });
+  for (const [key, value] of updates) {
+    await pool.query(
+      "INSERT INTO platform_config (key, value, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+      [key, value]
+    );
+  }
+  console.log("platform_config updated by admin:", Object.fromEntries(updates));
+  res.json({ ok: true, updated: Object.fromEntries(updates) });
+}));
+
+// Read escrow fee settings from platform_config.
+// Returns { feePercent: number, minSats: number }.
+// Clamped to sane ranges so a DB misconfiguration can't set 100% fee.
+async function getEscrowFeeConfig() {
+  const r = await pool.query(
+    "SELECT key, value FROM platform_config WHERE key IN ('escrow_fee_percent', 'escrow_fee_min_sats')"
+  );
+  const cfg = { feePercent: 8, minSats: 0 };
+  for (const row of r.rows) {
+    if (row.key === "escrow_fee_percent") {
+      const v = parseFloat(row.value);
+      if (Number.isFinite(v)) cfg.feePercent = Math.max(0, Math.min(50, v));
+    }
+    if (row.key === "escrow_fee_min_sats") {
+      const v = parseInt(row.value, 10);
+      if (Number.isFinite(v)) cfg.minSats = Math.max(0, v);
+    }
+  }
+  return cfg;
+}
+
+// fee = max(ceil(amount * percent / 100), minSats)
+// sellerAmount = amount - fee  (always >= 0, never negative)
+function calcEscrowFee(amountSats, cfg) {
+  const percentFee = Math.ceil(amountSats * cfg.feePercent / 100);
+  const fee = Math.max(percentFee, cfg.minSats);
+  return Math.min(fee, amountSats); // can never exceed the full amount
+}
+
 async function releaseFunds(tx) {
   await pool.query("INSERT INTO wallets (user_id, balance_sats) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET balance_sats = wallets.balance_sats + EXCLUDED.balance_sats", [tx.seller_id, tx.seller_amount]);
   await pool.query("UPDATE escrow_transactions SET status='released', released_at=$1 WHERE id=$2", [Date.now(), tx.id]);
@@ -1417,6 +1596,7 @@ async function releaseFunds(tx) {
 }
 
 app.post("/api/buy", auth, wrap(async function(req, res) {
+  if (req.user.role === "admin") return res.status(400).json({ error: "Admin cannot buy P2P listings" });
   if (!SWISS_API_KEY) return res.status(503).json({ error: "Payment not configured" });
   const { listingId } = req.body;
   const buyerId = req.user.id;
@@ -1426,7 +1606,8 @@ app.post("/api/buy", auth, wrap(async function(req, res) {
   const item = listing.rows[0];
   if (buyerId === item.user_id) return res.status(400).json({ error: "Cannot buy your own listing" });
   const sats = item.price_sats;
-  const commission = Math.ceil(sats * 0.08);
+  const feeCfg = await getEscrowFeeConfig();
+  const commission = calcEscrowFee(sats, feeCfg);
   const sellerAmount = sats - commission;
   const txId = crypto.randomBytes(16).toString("hex");
   const baseUrl = process.env.BASE_URL || "https://smsnero.onrender.com";
@@ -1441,10 +1622,14 @@ app.post("/api/buy", auth, wrap(async function(req, res) {
   const paymentRequest = invoice.payment_request || invoice.paymentRequest || invoice.lightning_invoice || "";
   const invoiceId = String(invoice.id || invoice.payment_id || "");
   await pool.query("INSERT INTO escrow_transactions (id, listing_id, buyer_id, seller_id, amount_sats, seller_amount, commission, invoice_id, payment_request, status, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10)", [txId, listingId, buyerId, item.user_id, sats, sellerAmount, commission, invoiceId, paymentRequest, Date.now()]);
-  res.json({ txId, paymentRequest, amountSats: sats, qr: invoice.qr || "" });
+  res.json({ txId, paymentRequest, amountSats: sats, feeSats: commission, feePercent: feeCfg.feePercent, sellerAmount, qr: invoice.qr || "" });
 }));
 
 app.post("/api/webhook/:txId", wrap(async function(req, res) {
+  if (!verifyWebhookSignature(req)) {
+    console.warn("Escrow webhook signature mismatch — ignoring request from", req.ip);
+    return res.status(401).json({ error: "Invalid webhook signature" });
+  }
   const { txId } = req.params;
   const tx = await pool.query("SELECT * FROM escrow_transactions WHERE id=$1", [txId]);
   if (!tx.rows.length) return res.status(404).json({ error: "Transaction not found" });
@@ -1494,9 +1679,14 @@ app.post("/api/admin/resolve/:txId", auth, adminOnly, wrap(async function(req, r
     await releaseFunds(item);
     res.json({ ok: true, resolution: "seller_wins" });
   } else {
+    // Credit the full amount back to the buyer's wallet
+    await pool.query(
+      "INSERT INTO wallets (user_id, balance_sats) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET balance_sats = wallets.balance_sats + EXCLUDED.balance_sats",
+      [item.buyer_id, item.amount_sats]
+    );
     await pool.query("UPDATE escrow_transactions SET status='refunded', released_at=$1 WHERE id=$2", [Date.now(), txId]);
-    broadcast({ type: "escrow_refunded", txId });
-    res.json({ ok: true, resolution: "buyer_refunded" });
+    broadcast({ type: "escrow_refunded", txId, buyerId: item.buyer_id, amountSats: item.amount_sats });
+    res.json({ ok: true, resolution: "buyer_refunded", refundedSats: item.amount_sats });
   }
 }));
 

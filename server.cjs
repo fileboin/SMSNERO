@@ -498,10 +498,16 @@ const HTML = `<!DOCTYPE html>
           <h4 style="color:#a5b4fc;">MacroDroid Setup (jednom)</h4>
           <ol style="color:#ccc;font-size:0.87em;line-height:1.9em;">
             <li><strong>Trigger:</strong> Periodic timer &mdash; svake <strong>30 sekundi</strong></li>
-            <li><strong>Action 1:</strong> HTTP Request GET &rarr;<br><code id="poll-url" style="color:#facc15;font-size:0.9em;word-break:break-all;"></code></li>
+            <li><strong>Action 1:</strong> HTTP Request GET &rarr;<br>
+              <code id="poll-url" style="color:#facc15;font-size:0.9em;word-break:break-all;"></code><br>
+              <span style="color:#94a3b8;font-size:0.85em;">Header: <code style="color:#a5b4fc;">Authorization: Bearer <span id="macro-token-display" style="color:#fbbf24;font-size:0.92em;word-break:break-all;"></span></code></span>
+            </li>
             <li><strong>Condition:</strong> HTTP response code = 200 (preskoči ako 204)</li>
             <li><strong>Action 2:</strong> Send SMS &rarr; primatelj: <code style="color:#a5b4fc;">{http_response_body:json_object:recipient}</code> &nbsp; tekst: <code style="color:#a5b4fc;">{http_response_body:json_object:message}</code></li>
-            <li><strong>Action 3:</strong> HTTP Request GET &rarr;<br><code id="ack-url" style="color:#4ade80;font-size:0.9em;word-break:break-all;"></code></li>
+            <li><strong>Action 3:</strong> HTTP Request GET &rarr;<br>
+              <code id="ack-url" style="color:#4ade80;font-size:0.9em;word-break:break-all;"></code><br>
+              <span style="color:#94a3b8;font-size:0.85em;">Header: Authorization: Bearer &lt;isti token&gt;</span>
+            </li>
           </ol>
         </div>
       </div>
@@ -623,7 +629,7 @@ const HTML = `<!DOCTYPE html>
     async function submitP2P(){var phone=document.getElementById("p2p-phone").value.trim();var price=Number(document.getElementById("p2p-price").value);var desc=document.getElementById("p2p-desc").value.trim();if(!phone||!price)return setStatus("Enter phone number and price.",true);var r=await fetch("/p2p/submit",{method:"POST",headers:authH({"Content-Type":"application/json"}),body:JSON.stringify({phoneNumber:phone,priceSats:price,description:desc})});var d=await r.json().catch(function(){return{error:"Error"};});if(!r.ok)return setStatus(d.error||"Error.",true);setStatus("Listing submitted! Waiting for admin approval.",false);document.getElementById("p2p-phone").value="";document.getElementById("p2p-price").value="";document.getElementById("p2p-desc").value="";loadMyP2PListings();}
     async function loadP2PMarket(){if(!token)return;var r=await fetch("/p2p/market",{headers:authH()});if(!r.ok)return;var data=await r.json();var h="";if(!data.length)h="<p class='muted'>No listings in the marketplace yet. Be the first to list your number!</p>";data.forEach(function(i){h+="<div class='box row'><span><strong>"+esc(i.phone_number)+"</strong> &mdash; <span class='ln-yellow'>"+esc(i.price_sats)+" sats</span>"+(i.description?"<br><span class='muted' style='font-size:0.85em;'>"+esc(i.description)+"</span>":"")+"<br><span class='muted' style='font-size:0.78em;'>&#128274; Escrow protected &bull; 8% fee</span></span><button onclick='escrowBuyP2P("+i.id+","+i.price_sats+")' style='background:linear-gradient(135deg,#1e3a2e,#166534);border:1px solid #4ade80;color:#4ade80;'>&#128274; Escrow Buy</button></div>";});document.getElementById("p2p-market").innerHTML=h;}
     async function loadMyP2PListings(){if(!token)return;var r=await fetch("/p2p/my-listings",{headers:authH()});if(!r.ok)return;var data=await r.json();if(!data.length){document.getElementById("p2p-my-listings").innerHTML="";document.getElementById("p2p-submit-box").style.display="block";return;}document.getElementById("p2p-submit-box").style.display="block";var h="<div class='box'><h4>My listings</h4>";data.forEach(function(i){var earned=i.owner_earned_sats||0;var paid=i.owner_paid_sats||0;h+="<div class='box' style='margin:8px 0;'><strong>"+esc(i.phone_number)+"</strong> &mdash; "+esc(i.price_sats)+" sats &mdash; <span style='color:"+(i.approved?"#4ade80":"#fca5a5")+"'>"+(i.approved?"Active":"Pending approval")+"</span><br><span class='muted' style='font-size:0.85em;'>Earned: "+earned+" sats | Paid out: "+paid+" sats | Owed: "+(earned-paid)+" sats</span></div>";});h+="</div>";document.getElementById("p2p-my-listings").innerHTML=h;}
-    function renderSendTab(){if(!token){document.getElementById("send-login-box").style.display="block";document.getElementById("send-admin-panel").style.display="none";document.getElementById("send-client-panel").style.display="none";return;}document.getElementById("send-login-box").style.display="none";if(role==="admin"){document.getElementById("send-admin-panel").style.display="block";document.getElementById("send-client-panel").style.display="none";var base=location.origin;document.getElementById("poll-url").textContent=base+"/api/pending-sms?key="+token;document.getElementById("ack-url").textContent=base+"/api/sms-sent/[id]?key="+token;loadSendNumbersAdmin();loadOutbox();}else{document.getElementById("send-admin-panel").style.display="none";document.getElementById("send-client-panel").style.display="block";loadSendNumbers();checkSendCredit();loadMySent();}}
+    function renderSendTab(){if(!token){document.getElementById("send-login-box").style.display="block";document.getElementById("send-admin-panel").style.display="none";document.getElementById("send-client-panel").style.display="none";return;}document.getElementById("send-login-box").style.display="none";if(role==="admin"){document.getElementById("send-admin-panel").style.display="block";document.getElementById("send-client-panel").style.display="none";var base=location.origin;document.getElementById("poll-url").textContent=base+"/api/pending-sms";document.getElementById("ack-url").textContent=base+"/api/sms-sent/[id]";var td=document.getElementById("macro-token-display");if(td)td.textContent=token;loadSendNumbersAdmin();loadOutbox();}else{document.getElementById("send-admin-panel").style.display="none";document.getElementById("send-client-panel").style.display="block";loadSendNumbers();checkSendCredit();loadMySent();}}
     async function addSendNumber(){var phone=document.getElementById("sn-phone").value.trim();var price=Number(document.getElementById("sn-price").value);if(!phone||!price)return setStatus("Enter phone and price.",true);var r=await fetch("/admin/send-numbers",{method:"POST",headers:authH({"Content-Type":"application/json"}),body:JSON.stringify({phoneNumber:phone,priceSats:price})});var d=await r.json().catch(function(){return{error:"Error"};});if(!r.ok)return setStatus(d.error||"Error.",true);setStatus("Send number added.",false);document.getElementById("sn-phone").value="";document.getElementById("sn-price").value="";loadSendNumbersAdmin();}
     async function loadSendNumbersAdmin(){if(role!=="admin")return;var r=await fetch("/admin/send-numbers",{headers:authH()});if(!r.ok)return;var data=await r.json();var h="";data.forEach(function(i){h+="<div class='box row'><span><strong>"+esc(i.phone_number)+"</strong> &mdash; <span class='ln-yellow'>"+esc(i.price_sats)+" sats</span> <span class='muted'>"+(i.active?"active":"disabled")+"</span></span><button onclick='disableSendNumber("+i.id+")' class='btn-danger' style='padding:6px 12px;'>Disable</button></div>";});document.getElementById("send-numbers-admin-list").innerHTML=h||"<p class='muted'>No send numbers yet.</p>";}
     async function disableSendNumber(id){var r=await fetch("/admin/send-numbers/"+id,{method:"DELETE",headers:authH()});if(!r.ok)return setStatus("Error.",true);setStatus("Disabled.",false);loadSendNumbersAdmin();}
@@ -1315,13 +1321,26 @@ app.get("/my-sent", auth, wrap(async function(req, res) {
   res.json(r.rows);
 }));
 
+// Extract the admin JWT for MacroDroid endpoints.
+// Primary: Authorization: Bearer <token> header.
+// Fallback: ?key=<token> query param (deprecated — avoid; token leaks into logs).
+function macrodroidAuth(req, res) {
+  const authHeader = req.headers.authorization || "";
+  let key = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+  if (!key) {
+    key = String(req.query.key || "").trim();
+    if (key) console.warn("MacroDroid: token supplied via query param — switch to Authorization: Bearer header");
+  }
+  if (!key) { res.status(401).json({ error: "Missing Authorization header (Bearer token required)" }); return null; }
+  let user;
+  try { user = verifyToken(key); } catch(e) { res.status(403).json({ error: "Invalid or expired token" }); return null; }
+  if (user.role !== "admin") { res.status(403).json({ error: "Admin only" }); return null; }
+  return user;
+}
+
 // MacroDroid polling: returns next pending SMS
 app.get("/api/pending-sms", wrap(async function(req, res) {
-  const key = String(req.query.key || "").trim();
-  if (!key) return res.status(401).json({ error: "Missing key" });
-  let user;
-  try { user = verifyToken(key); } catch(e) { return res.status(403).json({ error: "Invalid key" }); }
-  if (user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+  if (!macrodroidAuth(req, res)) return;
   const r = await pool.query("SELECT id, recipient, message FROM outbox WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1");
   if (!r.rows.length) return res.status(204).send("");
   res.json(r.rows[0]);
@@ -1329,11 +1348,7 @@ app.get("/api/pending-sms", wrap(async function(req, res) {
 
 // MacroDroid confirm: marks SMS as sent
 app.get("/api/sms-sent/:id", wrap(async function(req, res) {
-  const key = String(req.query.key || "").trim();
-  if (!key) return res.status(401).json({ error: "Missing key" });
-  let user;
-  try { user = verifyToken(key); } catch(e) { return res.status(403).json({ error: "Invalid key" }); }
-  if (user.role !== "admin") return res.status(403).json({ error: "Admin only" });
+  if (!macrodroidAuth(req, res)) return;
   const id = Number(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: "Invalid ID" });
   await pool.query("UPDATE outbox SET status = 'sent' WHERE id = $1", [id]);

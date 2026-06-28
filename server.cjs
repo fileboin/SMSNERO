@@ -25,9 +25,22 @@ if (!DATABASE_URL) throw new Error("DATABASE_URL is required");
 if (!JWT_SECRET) throw new Error("JWT_SECRET / SESSION_SECRET is required");
 if (!ADMIN_PASSWORD) throw new Error("ADMIN_PASSWORD is required");
 
+// Build a safe SSL config for the PostgreSQL pool.
+// - If DATABASE_SSL_CA is set, use it as the CA certificate (most secure: pinned CA).
+// - If NODE_ENV=production without a CA, validate the chain against system CAs
+//   (works for Render/Heroku managed databases which use a trusted CA).
+// - Never use rejectUnauthorized:false — that disables all cert validation.
+function buildPoolSsl() {
+  if (process.env.NODE_ENV !== "production") return false;
+  if (process.env.DATABASE_SSL_CA) {
+    return { rejectUnauthorized: true, ca: process.env.DATABASE_SSL_CA };
+  }
+  return { rejectUnauthorized: true };
+}
+
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
+  ssl: buildPoolSsl(),
 });
 
 const sockets = new Set();

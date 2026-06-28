@@ -309,6 +309,9 @@ function broadcast(message) {
 
 async function initDb() {
   await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  // Reserve id=0 for the synthetic "system" admin so FK constraints never fail when
+  // the admin JWT (which carries id:0) is the actor on any write operation.
+  await pool.query(`INSERT INTO users (id, username, role) VALUES (0, 'system', 'admin') ON CONFLICT (id) DO NOTHING`);
   await pool.query(`CREATE TABLE IF NOT EXISTS numbers (id SERIAL PRIMARY KEY, phone_number TEXT NOT NULL UNIQUE, price_sats INTEGER NOT NULL CHECK (price_sats > 0), active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
   await pool.query(`CREATE TABLE IF NOT EXISTS invoices (id BIGSERIAL PRIMARY KEY, provider_payment_id TEXT, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, number_id INTEGER NOT NULL REFERENCES numbers(id) ON DELETE CASCADE, amount_sats INTEGER NOT NULL CHECK (amount_sats > 0), status TEXT NOT NULL DEFAULT 'pending', checkout_url TEXT, qr TEXT, country TEXT, service TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
   await pool.query(`CREATE TABLE IF NOT EXISTS sessions (id BIGSERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, number_id INTEGER NOT NULL REFERENCES numbers(id) ON DELETE CASCADE, invoice_id BIGINT REFERENCES invoices(id) ON DELETE SET NULL, expires_at TIMESTAMPTZ NOT NULL, country TEXT, service TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
@@ -1400,6 +1403,7 @@ app.get("/public/referral-codes", wrap(async function(req, res) {
 
 // USER: use referral code
 app.post("/use-referral", auth, wrap(async function(req, res) {
+  if (req.user.role === "admin") return res.status(400).json({ error: "Admin cannot use referral codes" });
   const { code } = req.body;
   if (!code) return res.status(400).json({ error: "Code is required" });
   const codeRow = await pool.query("SELECT * FROM referral_codes WHERE code = $1 AND is_active = TRUE", [String(code).toUpperCase()]);
@@ -1542,6 +1546,7 @@ async function releaseFunds(tx) {
 }
 
 app.post("/api/buy", auth, wrap(async function(req, res) {
+  if (req.user.role === "admin") return res.status(400).json({ error: "Admin cannot buy P2P listings" });
   if (!SWISS_API_KEY) return res.status(503).json({ error: "Payment not configured" });
   const { listingId } = req.body;
   const buyerId = req.user.id;

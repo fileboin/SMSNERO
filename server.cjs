@@ -636,7 +636,7 @@ const HTML = `<!DOCTYPE html>
     async function submitMessage(){var creditId=document.getElementById("send-compose-box").dataset.creditId;var recipient=document.getElementById("send-recipient").value.trim();var message=document.getElementById("send-message").value.trim();if(!recipient||!message)return setStatus("Enter recipient and message.",true);var r=await fetch("/send-message",{method:"POST",headers:authH({"Content-Type":"application/json"}),body:JSON.stringify({creditId:creditId,recipient:recipient,message:message})});var d=await r.json().catch(function(){return{error:"Error"};});if(!r.ok)return setStatus(d.error||"Error.",true);setStatus("Message queued! Will be sent shortly.",false);document.getElementById("send-recipient").value="";document.getElementById("send-message").value="";document.getElementById("send-compose-box").style.display="none";loadMySent();}
     async function loadMySent(){if(!token||role==="admin")return;var r=await fetch("/my-sent",{headers:authH()});if(!r.ok)return;var data=await r.json();var box=document.getElementById("my-sent-box");if(!data.length){box.style.display="none";return;}box.style.display="block";var h="";data.forEach(function(i){var col=i.status==="sent"?"#4ade80":"#facc15";h+="<div class='box row'><span><strong>"+esc(i.recipient)+"</strong><br><span class='muted' style='font-size:0.85em;'>"+esc(i.message)+"</span></span><span style='color:"+col+";font-weight:bold;font-size:0.88em;'>"+esc(i.status)+"</span></div>";});document.getElementById("my-sent-list").innerHTML=h;}
     var _p2pData={};
-    async function buyP2P(id){setStatus("Creating invoice...",false);var r=await fetch("/create-invoice",{method:"POST",headers:authH({"Content-Type":"application/json"}),body:JSON.stringify({p2pListingId:id})});var inv=await r.json().catch(function(){return{error:"Error"};});if(!r.ok)return setStatus(inv.error||"Error.",true);setStatus("Scan QR to pay.",false);_lightningInvoice=inv.lightning_invoice||"";var lnHtml="";if(_lightningInvoice){lnHtml="<textarea style='width:100%;box-sizing:border-box;background:#111;color:#facc15;border:1px solid #444;border-radius:8px;padding:8px;font-size:0.75em;margin-top:8px;resize:none;' rows='3' readonly>"+esc(_lightningInvoice)+"</textarea><br><button onclick='copyLightning()' style='margin-top:4px;'>Copy Lightning Invoice</button>";}var chkHtml=inv.checkout_url?"<br><a href='"+esc(inv.checkout_url)+"' target='_blank'>Open in Browser</a>":"";switchTab("rent");document.getElementById("qr").innerHTML="<div class='box'><h3>Scan Lightning QR (P2P)</h3><p>Amount: "+esc(inv.amount_sats)+" sats</p><img src='"+esc(inv.qr)+"' width='220' alt='QR'>"+lnHtml+chkHtml+"</div>";startPolling();}
+    /* buyP2P() removed — all P2P purchases now go through escrowBuyP2P() → /api/buy */
     var COUNTRIES=["Albania","Argentina","Australia","Austria","Bangladesh","Belarus","Belgium","Bosnia","Brazil","Bulgaria","Canada","Chile","China","Colombia","Croatia","Czech Republic","Denmark","Egypt","Estonia","Finland","France","Germany","Greece","Hong Kong","Hungary","India","Indonesia","Ireland","Israel","Italy","Japan","Kazakhstan","Kenya","Kosovo","Latvia","Lithuania","Malaysia","Mexico","Montenegro","Morocco","Netherlands","New Zealand","Nigeria","North Macedonia","Norway","Pakistan","Peru","Philippines","Poland","Portugal","Romania","Russia","Saudi Arabia","Serbia","Singapore","Slovakia","Slovenia","South Africa","South Korea","Spain","Sweden","Switzerland","Taiwan","Thailand","Turkey","UAE","UK","Ukraine","USA","Vietnam","Other"];
     var SERVICES=["Telegram","WhatsApp","Viber","Signal","Instagram","Facebook","Messenger","Twitter / X","TikTok","Snapchat","YouTube","Twitch","Discord","LinkedIn","Pinterest","Reddit","Clubhouse","BeReal","Threads","Google","Apple","Microsoft","Amazon","Netflix","Spotify","Disney+","HBO Max","Hulu","Prime Video","Steam","Twitch","Uber","Uber Eats","Airbnb","Booking.com","Fiverr","Upwork","Etsy","eBay","Shopify","Tinder","Bumble","Hinge","Badoo","OkCupid","PayPal","Cash App","Venmo","Wise","Revolut","Skrill","Neteller","N26","Monzo","Coinbase","Binance","Bybit","OKX","KuCoin","Kraken","Bitget","MEXC","Gate.io","Nexo","Crypto.com","Dropbox","GitHub","Slack","Zoom","Teams","Notion","Trello","Figma","ChatGPT","Other"];
     var _numsData={};
@@ -883,6 +883,11 @@ app.post("/create-invoice", auth, wrap(async function(req, res) {
     return res.json({ invoice_id: invoiceId, amount_sats: priceSats, qr: qr, lightning_invoice: lightningInvoice, checkout_url: data.checkoutUrl || data.url, mode: "provider" });
   }
 
+  // P2P purchases must go through POST /api/buy (escrow flow), not this endpoint.
+  if (req.body.p2pListingId) {
+    return res.status(410).json({ error: "P2P purchases must use POST /api/buy (escrow flow). This path has been removed." });
+  }
+
   let number, p2pListingId = null, sendNumberId = null;
   if (req.body.sendNumberId) {
     const sid = Number(req.body.sendNumberId);
@@ -891,18 +896,6 @@ app.post("/create-invoice", auth, wrap(async function(req, res) {
     if (!sr.rows[0]) return res.status(400).json({ error: "Send number not available" });
     number = { id: sr.rows[0].id, phone_number: sr.rows[0].phone_number, price_sats: sr.rows[0].price_sats, _isSend: true };
     sendNumberId = sid;
-  } else if (req.body.p2pListingId) {
-    const lid = Number(req.body.p2pListingId);
-    if (!Number.isInteger(lid) || lid <= 0) return res.status(400).json({ error: "Invalid P2P listing ID" });
-    const lr = await pool.query("SELECT * FROM p2p_listings WHERE id = $1 AND approved = TRUE AND active = TRUE", [lid]);
-    const listing = lr.rows[0];
-    if (!listing) return res.status(400).json({ error: "P2P listing not available" });
-    if (!listing.number_id) return res.status(400).json({ error: "P2P listing not linked to a number yet" });
-    const nr = await pool.query("SELECT id, phone_number, price_sats FROM numbers WHERE id = $1 AND active = TRUE", [listing.number_id]);
-    if (!nr.rows[0]) return res.status(400).json({ error: "P2P number not available" });
-    number = nr.rows[0];
-    number.price_sats = listing.price_sats;
-    p2pListingId = lid;
   } else {
     const numberId = Number(req.body.numberId);
     if (!Number.isInteger(numberId) || numberId <= 0) return res.status(400).json({ error: "Invalid number ID" });
@@ -913,7 +906,7 @@ app.post("/create-invoice", auth, wrap(async function(req, res) {
   const appUrl = process.env.APP_URL || ("https://" + (process.env.RENDER_EXTERNAL_HOSTNAME || "smsnero.onrender.com"));
   const payload = {
     title: "SMSNero",
-    description: (p2pListingId ? "[P2P] " : "") + "Phone number: " + number.phone_number,
+    description: "Phone number: " + number.phone_number,
     amount: number.price_sats,
     unit: "sat",
     onChain: false,
@@ -942,8 +935,8 @@ app.post("/create-invoice", auth, wrap(async function(req, res) {
   const qr = await QRCode.toDataURL(qrSource);
   const country = String(req.body.country || "").trim().slice(0, 100) || null;
   const service = String(req.body.service || "").trim().slice(0, 100) || null;
-  // Try wallet payment first (only for regular number purchases, atomic balance check)
-  if (!p2pListingId && !sendNumberId && !number._isSend) {
+  // Try wallet payment first (only for regular number and send-credit purchases)
+  if (!sendNumberId && !number._isSend) {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -965,8 +958,8 @@ app.post("/create-invoice", auth, wrap(async function(req, res) {
   }
   const numIdForInvoice = number._isSend ? null : number.id;
   const result = await pool.query(
-    "INSERT INTO invoices (provider_payment_id, user_id, number_id, amount_sats, status, checkout_url, qr, country, service, p2p_listing_id, send_number_id) VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9, $10) RETURNING *",
-    [data.id || null, req.user.id, numIdForInvoice, number.price_sats, checkoutUrl || qrSource, qr, country, service, p2pListingId, sendNumberId]
+    "INSERT INTO invoices (provider_payment_id, user_id, number_id, amount_sats, status, checkout_url, qr, country, service, send_number_id) VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9) RETURNING *",
+    [data.id || null, req.user.id, numIdForInvoice, number.price_sats, checkoutUrl || qrSource, qr, country, service, sendNumberId]
   );
   const row = result.rows[0];
   row.lightning_invoice = lightningInvoice;
@@ -1018,10 +1011,6 @@ app.post("/webhook", wrap(async function(req, res) {
     } else {
       const expiresAt = new Date(Date.now() + SESSION_DURATION_HOURS * 3600000);
       await pool.query("INSERT INTO sessions (user_id, number_id, invoice_id, expires_at, country, service) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING", [invoice.user_id, invoice.number_id, invoice.id, expiresAt, invoice.country || null, invoice.service || null]);
-      if (invoice.p2p_listing_id) {
-        const ownerShare = Math.floor(invoice.amount_sats * 0.5);
-        await pool.query("UPDATE p2p_listings SET owner_earned_sats = owner_earned_sats + $1 WHERE id = $2", [ownerShare, invoice.p2p_listing_id]);
-      }
       broadcast({ type: "session_activated", userId: invoice.user_id, numberId: invoice.number_id });
     }
     return res.sendStatus(200);

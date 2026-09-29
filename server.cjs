@@ -369,6 +369,10 @@ async function initDb() {
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS provider TEXT`);
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS provider_order_id TEXT`);
   await pool.query(`CREATE TABLE IF NOT EXISTS escrow_transactions (id TEXT PRIMARY KEY, listing_id BIGINT REFERENCES p2p_listings(id) ON DELETE SET NULL, buyer_id INTEGER REFERENCES users(id) ON DELETE SET NULL, seller_id INTEGER REFERENCES users(id) ON DELETE SET NULL, amount_sats INTEGER NOT NULL, seller_amount INTEGER NOT NULL, commission INTEGER NOT NULL, invoice_id TEXT, payment_request TEXT, status TEXT NOT NULL DEFAULT 'pending', dispute_reason TEXT, created_at BIGINT NOT NULL, paid_at BIGINT, released_at BIGINT)`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS escrow_transactions_one_open_per_listing
+    ON escrow_transactions (listing_id)
+    WHERE listing_id IS NOT NULL
+      AND status NOT IN ('released', 'refunded');`);
   await pool.query(`CREATE TABLE IF NOT EXISTS platform_config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
   await pool.query(`INSERT INTO platform_config (key, value) VALUES ('escrow_fee_percent', '8') ON CONFLICT (key) DO NOTHING`);
   await pool.query(`INSERT INTO platform_config (key, value) VALUES ('escrow_fee_min_sats', '0') ON CONFLICT (key) DO NOTHING`);
